@@ -25,7 +25,6 @@ from .utils import (
     vectorize,
 )
 
-
 __all__ = [
     "integrate_power_in_frequency_range",
     "positive_fft_bins",
@@ -39,6 +38,9 @@ __all__ = [
     "bias_term",
     "raw_coherence",
     "intrinsic_coherence",
+    "avg_bispectrum_from_iterable",
+    "avg_bispectrum_from_timeseries",
+    "bicoherence_from_sums",
 ]
 
 
@@ -2993,6 +2995,401 @@ def avg_pds_from_timeseries(
     if cross is not None:
         cross.meta["gti"] = gti
     return cross
+
+
+def _bispectrum_frequency_grid(n_bin, dt):
+    """Frequency axis and (f1, f2) bin-index grid for a bispectrum.
+
+    The bispectrum ``B(f1, f2)`` is sampled on the positive-frequency axis of an
+    ``n_bin``-point FFT. Because the third frequency is ``f3 = f1 + f2``, the
+    quantity is only defined where ``f1 + f2`` is still a resolved (``<=``
+    Nyquist) frequency. This helper returns the positive frequency array, the
+    integer FFT bin indices of ``f1`` and ``f2`` on a 2D grid, the bin indices
+    of ``f1 + f2``, and a boolean mask of the valid (non-redundant, resolved)
+    region of the plane.
+
+    Parameters
+    ----------
+    n_bin : int
+        Number of bins in the FFT of each segment.
+    dt : float
+        Time resolution of the light curve.
+
+    Returns
+    -------
+    freq : `np.array`
+        The positive Fourier frequencies (length ``nf``).
+    idx1, idx2 : `np.array`
+        ``(nf, nf)`` integer arrays with the FFT bin indices of ``f1`` and
+        ``f2``.
+    idx3_safe : `np.array`
+        ``(nf, nf)`` integer array with the FFT bin index of ``f1 + f2``,
+        clipped to a safe value where the sum is beyond the Nyquist bin (those
+        entries are masked out by ``valid``).
+    valid : `np.array`
+        ``(nf, nf)`` boolean mask, ``True`` where ``f1 + f2`` is at or below the
+        Nyquist frequency.
+    """
+    fgt0 = positive_fft_bins(n_bin)
+    freq = fftfreq(n_bin, dt)[fgt0]
+    # FFT bin indices of the positive frequencies (fgt0 starts at bin 1)
+    kbins = np.arange(fgt0.start, fgt0.stop)
+    nyquist_bin = n_bin // 2
+
+    idx1, idx2 = np.meshgrid(kbins, kbins, indexing="ij")
+    idx3 = idx1 + idx2
+    valid = idx3 <= nyquist_bin
+    # Clip out-of-range sum indices to 0 so fancy-indexing stays in bounds;
+    # these entries are discarded via ``valid``.
+    idx3_safe = np.where(valid, idx3, 0)
+    return freq, idx1, idx2, idx3_safe, valid
+
+
+#: Recognised bicoherence normalizations (see ``bicoherence_from_sums``).
+
+
+
+def bicoherence_from_sums(norm, abs_bispec_sum, denom1, denom2, sum_abs_triple, valid=None):
+    r"""Compute a bicoherence from the accumulated bispectrum sums.
+
+    Given, for each frequency pair :math:`(f_1, f_2)`, the summed triple
+    product magnitude :math:`|\sum_i T_i|` (with
+    :math:`T_i = X_i(f_1) X_i(f_2) X_i^{*}(f_1+f_2)`), the summed power terms
+    :math:`\sum_i |X_i(f_1) X_i(f_2)|^2` and :math:`\sum_i |X_i(f_1+f_2)|^2`,
+    and the summed per-segment magnitude :math:`\sum_i |T_i|`, return the
+    bicoherence under one of several normalizations. All variants lie in
+    ``[0, 1]``.
+
+    Parameters
+    ----------
+    norm : str
+        One of:
+
+        ``"kim_powers"``
+            Squared bicoherence of Kim & Powers (1979); the plasma-physics
+            standard (Nagashima 2006) and the form used by Maccarone (2013):
+
+            .. math::
+
+                b^2 = \frac{\left|\sum_i T_i\right|^2}
+                           {\sum_i |X_i(f_1) X_i(f_2)|^2 \;
+                            \sum_i |X_i(f_1+f_2)|^2}
+
+            Note this returns the **squared** bicoherence.
+
+        ``"sigl_chamoun"``
+            Sigl & Chamoun (1994); the (unsquared) square root of the
+            Kim & Powers value:
+
+            .. math::
+
+                b = \frac{\left|\sum_i T_i\right|}
+                         {\sqrt{\sum_i |X_i(f_1) X_i(f_2)|^2 \;
+                                \sum_i |X_i(f_1+f_2)|^2}}
+
+        ``"hagihira"``
+            Hagihira (2001) / Hayashi (2007); normalizes by the summed
+            magnitude of the per-segment triple products (the value the
+            numerator would reach with perfect phase coupling):
+
+            .. math::
+
+                b = \frac{\left|\sum_i T_i\right|}{\sum_i |T_i|}
+
+    abs_bispec_sum : `np.array`
+        :math:`|\sum_i T_i|`.
+    denom1 : `np.array`
+        :math:`\sum_i |X_i(f_1) X_i(f_2)|^2`.
+    denom2 : `np.array`
+        :math:`\sum_i |X_i(f_1+f_2)|^2`.
+    sum_abs_triple : `np.array`
+        :math:`\sum_i |T_i|`.
+    valid : `np.array`, optional
+        Boolean mask; entries where it is ``False`` are set to ``NaN``.
+
+    Returns
+    -------
+    bicoherence : `np.array`
+        The bicoherence, normalized to ``[0, 1]``.
+    """
+    bicoherence_norms = ("kim_powers", "sigl_chamoun", "hagihira")
+    norm = norm.lower()
+    if norm not in bicoherence_norms:
+        raise ValueError(f"Unknown bicoherence norm '{norm}'. Choose one of {bicoherence_norms}.")
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        if norm == "kim_powers":
+            out = abs_bispec_sum**2 / (denom1 * denom2)
+        elif norm == "sigl_chamoun":
+            out = abs_bispec_sum / np.sqrt(denom1 * denom2)
+        else:  # hagihira
+            out = abs_bispec_sum / sum_abs_triple
+
+    out = np.clip(out, 0.0, 1.0)
+    if valid is not None:
+        out = np.where(valid, out, np.nan)
+    return out
+
+
+def avg_bispectrum_from_iterable(
+    flux_iterable, dt, bicoherence_norm="kim_powers", silent=False, return_subbs=False
+):
+    """Bispectrum, bicoherence and biphase from an iterable of segments.
+
+    Implements the direct Fourier-decomposition estimator of the bispectrum
+    (Maccarone 2013, MNRAS 435, 3547; see also Kim & Powers 1979). For ``K``
+    segments with Fourier transforms ``X_i(f)``, the bispectrum is
+
+    .. math::
+
+        B(f_1, f_2) = \\frac{1}{K} \\sum_{i=0}^{K-1}
+            X_i(f_1)\\, X_i(f_2)\\, X_i^{*}(f_1 + f_2)
+
+    the squared bicoherence (Kim & Powers 1979 normalization) is
+
+    .. math::
+
+        b^2(f_1, f_2) =
+            \\frac{\\left|\\sum_i X_i(f_1) X_i(f_2) X_i^{*}(f_1+f_2)\\right|^2}
+                 {\\sum_i |X_i(f_1) X_i(f_2)|^2 \\; \\sum_i |X_i(f_1+f_2)|^2}
+
+    and the biphase is the phase of the (complex) bispectrum, defined over the
+    full :math:`2\\pi` interval.
+
+    Parameters
+    ----------
+    flux_iterable : iterable of `np.array`
+        Iterable of equal-length flux (counts/bin) arrays, one per segment, as
+        produced by `get_flux_iterable_from_segments`. Tuples of
+        ``(flux, error)`` are accepted; the error is ignored.
+    dt : float
+        Time resolution of the light curves.
+
+    Other Parameters
+    ----------------
+    silent : bool, default False
+        Silence the progress bar.
+    return_subbs : bool, default False
+        If True, also return the per-segment bispectra in the metadata (under
+        ``subbs``). Uses more memory.
+
+    Returns
+    -------
+    results : `astropy.table.Table` or None
+        A table with a ``freq`` column (the positive frequency axis) and, in
+        its metadata, the 2D arrays ``bispec``, ``bicoherence``, ``biphase``,
+        ``bispec_err`` and ``biphase_err`` (all ``nf x nf``, with the redundant
+        region set to ``NaN``), plus diagnostics (``m``, ``n``, ``dt``, ``df``,
+        ``nphots``, ``segment_size``). ``None`` if no usable segment was found.
+
+    Notes
+    -----
+    The bicoherence only becomes meaningful once several segments are averaged.
+    For a single segment (``m = 1``) it is identically 1 and the biphase error
+    is 0, by construction.
+    """
+    local_show_progress = show_progress
+    if silent:
+
+        def local_show_progress(a):
+            return a
+
+    idx1 = idx2 = idx3 = valid = freq = None
+    n_bin = None
+    bispec_sum = None  # complex: sum of X(f1) X(f2) X*(f1+f2)
+    denom1_sum = None  # real: sum of |X(f1) X(f2)|^2
+    denom2_sum = None  # real: sum of |X(f1+f2)|^2
+    abs_triple_sum = None  # real: sum of |X(f1) X(f2) X*(f1+f2)| (Hagihira norm)
+    # Accumulators for the standard error of the mean of the complex triple
+    sum_sq_re = None
+    sum_sq_im = None
+    # Accumulators for circular statistics of the biphase (unit phasors)
+    cos_sum = None
+    sin_sum = None
+
+    sum_of_photons = 0
+    n_ave = 0
+    subbs = [] if return_subbs else None
+
+    for flux in local_show_progress(flux_iterable):
+        if flux is None or np.all(flux == 0):
+            continue
+        if isinstance(flux, tuple):
+            flux, _ = flux
+
+        flux = np.asarray(flux)
+        if n_bin is None:
+            n_bin = flux.size
+            freq, idx1, idx2, idx3, valid = _bispectrum_frequency_grid(n_bin, dt)
+
+        ft = fft(flux)
+        sum_of_photons += flux.sum()
+
+        x1 = ft[idx1]
+        x2 = ft[idx2]
+        x3 = ft[idx3]
+        triple = x1 * x2 * np.conj(x3)
+        denom1 = (x1 * x2).real ** 2 + (x1 * x2).imag ** 2
+        denom2 = x3.real**2 + x3.imag**2
+
+        bispec_sum = sum_if_not_none_or_initialize(bispec_sum, triple)
+        denom1_sum = sum_if_not_none_or_initialize(denom1_sum, denom1)
+        denom2_sum = sum_if_not_none_or_initialize(denom2_sum, denom2)
+        sum_sq_re = sum_if_not_none_or_initialize(sum_sq_re, triple.real**2)
+        sum_sq_im = sum_if_not_none_or_initialize(sum_sq_im, triple.imag**2)
+
+        magnitude = np.abs(triple)
+        abs_triple_sum = sum_if_not_none_or_initialize(abs_triple_sum, magnitude)
+        # Avoid division by zero for empty bins; those phasors contribute 0.
+        with np.errstate(invalid="ignore", divide="ignore"):
+            unit = np.where(magnitude > 0, triple / magnitude, 0.0 + 0.0j)
+        cos_sum = sum_if_not_none_or_initialize(cos_sum, unit.real)
+        sin_sum = sum_if_not_none_or_initialize(sin_sum, unit.imag)
+
+        if return_subbs:
+            subbs.append(triple)
+
+        n_ave += 1
+
+    if bispec_sum is None:
+        return None
+
+    m = n_ave
+    bispec = bispec_sum / m
+
+    abs_bispec_sum = np.abs(bispec_sum)
+    bicoherence = bicoherence_from_sums(
+        bicoherence_norm, abs_bispec_sum, denom1_sum, denom2_sum, abs_triple_sum, valid=valid
+    )
+
+    biphase = np.angle(bispec)
+
+    # Standard error of the mean of the (complex) triple product.
+    if m > 1:
+        var_re = sum_sq_re / m - bispec.real**2
+        var_im = sum_sq_im / m - bispec.imag**2
+        var_re = np.clip(var_re, 0.0, None)
+        var_im = np.clip(var_im, 0.0, None)
+        bispec_err = np.sqrt((var_re + var_im) / m)
+
+        # Circular standard error of the biphase (Fisher 1993). rbar is the
+        # mean resultant length of the per-segment biphase phasors.
+        rbar = np.sqrt(cos_sum**2 + sin_sum**2) / m
+        rbar = np.clip(rbar, 1e-12, 1.0)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            circ_std = np.sqrt(-2.0 * np.log(rbar))
+        biphase_err = circ_std / np.sqrt(m)
+    else:
+        bispec_err = np.zeros_like(biphase)
+        biphase_err = np.zeros_like(biphase)
+
+    # Mask out the redundant / unresolved region.
+    for arr in (bispec, bispec_err, biphase, biphase_err):
+        arr[~valid] = np.nan
+    bicoherence = np.where(valid, bicoherence, np.nan)
+
+    n_ph = sum_of_photons / m
+
+    results = Table()
+    results["freq"] = freq
+    results.meta.update(
+        {
+            "freq": freq,
+            "bispec": bispec,
+            "bicoherence": bicoherence,
+            "bicoherence_norm": bicoherence_norm,
+            "biphase": biphase,
+            "bispec_err": bispec_err,
+            "biphase_err": biphase_err,
+            "valid": valid,
+            # Raw accumulated sums, kept so the bicoherence can be recomputed
+            # under a different normalization without redoing the FFTs.
+            "bicoh_abs_bispec_sum": abs_bispec_sum,
+            "bicoh_denom1": denom1_sum,
+            "bicoh_denom2": denom2_sum,
+            "bicoh_sum_abs": abs_triple_sum,
+            "n": n_bin,
+            "m": m,
+            "dt": dt,
+            "df": 1 / (dt * n_bin),
+            "nphots": n_ph,
+            "segment_size": dt * n_bin,
+        }
+    )
+    if return_subbs:
+        results.meta["subbs"] = subbs
+    return results
+
+
+def avg_bispectrum_from_timeseries(
+    times,
+    gti,
+    segment_size,
+    dt,
+    bicoherence_norm="kim_powers",
+    silent=False,
+    fluxes=None,
+    errors=None,
+    return_subbs=False,
+):
+    """Average bispectrum from event times or a light curve.
+
+    Splits the input into segments of length ``segment_size`` and averages the
+    Fourier-decomposition bispectrum over them. See
+    `avg_bispectrum_from_iterable` for the estimator definition.
+
+    Parameters
+    ----------
+    times : float `np.array`
+        Array of times (photon arrival times, or light-curve bin centers).
+    gti : [[gti00, gti01], ...]
+        Good time intervals.
+    segment_size : float
+        Length of segments. If ``None``, the full light curve is used as a
+        single segment (in which case the bicoherence is degenerate).
+    dt : float
+        Time resolution of the light curves.
+
+    Other Parameters
+    ----------------
+    silent : bool, default False
+        Silence the progress bar.
+    fluxes : float `np.array`, default None
+        Array of counts per bin. If ``None``, ``times`` is treated as event
+        arrival times and binned internally.
+    errors : float `np.array`, default None
+        Array of errors on the fluxes (currently unused by the estimator).
+    return_subbs : bool, default False
+        Return all per-segment bispectra in the metadata.
+
+    Returns
+    -------
+    results : `astropy.table.Table` or None
+        See `avg_bispectrum_from_iterable`.
+    """
+    binned = fluxes is not None
+    if gti is not None:
+        gti = np.asarray(gti)
+    if segment_size is not None:
+        segment_size, n_bin = fix_segment_size_to_integer_samples(segment_size, dt)
+    elif binned:
+        n_bin = fluxes.size
+    else:
+        _, n_bin = fix_segment_size_to_integer_samples(gti.max() - gti.min(), dt)
+
+    flux_iterable = get_flux_iterable_from_segments(
+        times, gti, segment_size, n_bin, dt=dt, fluxes=fluxes, errors=errors
+    )
+    bs = avg_bispectrum_from_iterable(
+        flux_iterable,
+        dt,
+        bicoherence_norm=bicoherence_norm,
+        silent=silent,
+        return_subbs=return_subbs,
+    )
+    if bs is not None:
+        bs.meta["gti"] = gti
+    return bs
 
 
 def avg_cs_from_events(*args, **kwargs):

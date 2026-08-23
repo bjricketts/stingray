@@ -1,455 +1,969 @@
-import numpy as np
-from scipy.linalg import toeplitz
 import warnings
+from collections.abc import Generator, Iterable
+
+import numpy as np
 import matplotlib.pyplot as plt
 
-from scipy.linalg import hankel
+from stingray.base import StingrayObject
 
-from stingray import lightcurve
-import stingray.utils as utils
-from stingray.utils import fftshift, fft2, ifftshift, fft
+from .events import EventList
+from .lightcurve import Lightcurve
+from .gti import cross_two_gtis
+from .fourier import (
+    avg_bispectrum_from_iterable,
+    avg_bispectrum_from_timeseries,
+    bicoherence_from_sums,
+    get_flux_iterable_from_segments,
+)
 
-__all__ = ["Bispectrum"]
+__all__ = ["Bispectrum", "AveragedBispectrum"]
 
 
-class Bispectrum(object):
-    """Makes a :class:`Bispectrum` object from a :class:`stingray.Lightcurve`.
+class Bispectrum(StingrayObject):
+    main_array_attr = "freq"
+    type = "bispectrum"
 
-    :class:`Bispectrum` is a higher order time series analysis method and is calculated by
-    indirect method as Fourier transform of triple auto-correlation function also called as
-    3rd order cumulant.
+    r"""Make a :class:`Bispectrum` from a (binned) light curve.
+
+    The bispectrum is a higher-order spectral statistic that measures
+    quadratic phase coupling between Fourier components of a time series. It is
+    computed here with the direct Fourier-decomposition method (Maccarone 2013;
+    Kim & Powers 1979) rather than as the Fourier transform of the third-order
+    cumulant. For ``m`` averaged segments with Fourier transforms
+    :math:`X_i(f)`,
+
+    .. math::
+
+        B(f_1, f_2) = \frac{1}{m} \sum_{i=0}^{m-1}
+            X_i(f_1)\, X_i(f_2)\, X_i^{*}(f_1 + f_2)
+
+    You can also make an empty :class:`Bispectrum` object to populate with your
+    own data.
+
+    A single :class:`Bispectrum` uses the whole light curve as one segment. To
+    get a statistically meaningful bispectrum, bicoherence and biphase you
+    normally want :class:`AveragedBispectrum`, which averages over many
+    segments.
 
     Parameters
     ----------
-    lc : :class:`stingray.Lightcurve` object
-        The light curve data for bispectrum calculation.
+    data : :class:`stingray.Lightcurve` or :class:`stingray.events.EventList`, optional, default ``None``
+        The light curve or event list to be Fourier-transformed. If an
+        :class:`EventList` is given, ``dt`` must be specified.
 
-    maxlag : int, optional, default ``None``
-        Maximum lag on both positive and negative sides of
-        3rd order cumulant (Similar to lags in correlation).
-        if ``None``, max lag is set to one-half of length of light curve.
+    Other Parameters
+    ----------------
+    dt : float
+        The time resolution of the light curve. Only needed when the input is
+        an :class:`EventList`.
 
-    window : {``uniform``, ``parzen``, ``hamming``, ``hanning``, ``triangular``, ``welch``, ``blackman``, ``flat-top``}, optional, default 'uniform'
-        Type of window function to apply to the data.
+    bicoherence_norm : {"kim_powers", "sigl_chamoun", "hagihira"}, default "kim_powers"
+        Which normalization to use for the ``bicoherence`` attribute. All lie
+        in ``[0, 1]``. With :math:`T_i = X_i(f_1) X_i(f_2) X_i^{*}(f_1+f_2)`:
 
-    scale : {``biased``, ``unbiased``}, optional, default ``biased``
-        Flag to decide biased or unbiased normalization for 3rd order cumulant function.
+        ``"kim_powers"``
+            The **squared** bicoherence of Kim & Powers (1979) -- the
+            plasma-physics standard (Nagashima 2006) and the form in
+            Maccarone (2013):
+            :math:`b^2 = |\sum_i T_i|^2 / (\sum_i |X_i(f_1)X_i(f_2)|^2 \sum_i |X_i(f_1+f_2)|^2)`.
+        ``"sigl_chamoun"``
+            Sigl & Chamoun (1994); the unsquared square root of the Kim &
+            Powers value,
+            :math:`b = |\sum_i T_i| / \sqrt{\sum_i |X_i(f_1)X_i(f_2)|^2 \sum_i |X_i(f_1+f_2)|^2}`.
+        ``"hagihira"``
+            Hagihira (2001) / Hayashi (2007); normalizes by the summed
+            magnitude of the per-segment triple products,
+            :math:`b = |\sum_i T_i| / \sum_i |T_i|`.
 
+        Any of these can be recomputed after the fact with
+        :meth:`recompute_bicoherence` (no FFTs are redone).
+
+    skip_checks : bool, default False
+        Skip initial checks, for speed or other reasons (you need to trust your
+        inputs!).
+
+    lc : :class:`stingray.Lightcurve`, optional
+        For backwards compatibility only. Like ``data``, but no
+        :class:`EventList` allowed. Deprecated.
 
     Attributes
     ----------
-    lc : :class:`stingray.Lightcurve` object
-        The light curve data to compute the :class:`Bispectrum`.
-
-    fs : float
-        Sampling frequencies
-
-    n : int
-        Total Number of samples of light curve observations.
-
-    maxlag : int
-        Maximum lag on both positive and negative sides of
-        3rd order cumulant (similar to lags in correlation)
-
-    signal : numpy.ndarray
-        Row vector of light curve counts for matrix operations
-
-    scale : {``biased``, ``unbiased``}
-        Flag to decide biased or unbiased normalization for 3rd order cumulant function.
-
-    lags : numpy.ndarray
-        An array of time lags for which 3rd order cumulant is calculated
-
     freq : numpy.ndarray
-        An array of freq values for :class:`Bispectrum`.
-
-    cum3 : numpy.ndarray
-        A ``maxlag*2+1 x maxlag*2+1`` matrix containing 3rd order cumulant data for different lags.
+        The array of positive Fourier frequencies that the transform samples.
 
     bispec : numpy.ndarray
-        A`` maxlag*2+1 x maxlag*2+1`` matrix containing bispectrum data for different frequencies.
+        The complex bispectrum, an ``nf x nf`` matrix indexed by
+        ``(freq, freq)``. The redundant/unresolved region (where
+        ``f1 + f2`` exceeds the Nyquist frequency) is set to ``NaN``.
+
+    bicoherence : numpy.ndarray
+        The bicoherence, a real ``nf x nf`` matrix in ``[0, 1]`` (0 = no
+        quadratic coupling, 1 = total coupling), computed with the
+        normalization given by ``bicoherence_norm``. Note the default
+        ``"kim_powers"`` returns the **squared** bicoherence. Only meaningful
+        once several segments are averaged. Use :meth:`recompute_bicoherence`
+        to obtain a different normalization.
+
+    bicoherence_norm : str
+        The normalization used for ``bicoherence``.
+
+    biphase : numpy.ndarray
+        The phase of the bispectrum, an ``nf x nf`` matrix defined over the
+        full :math:`2\pi` interval.
 
     bispec_mag : numpy.ndarray
-        Magnitude of the bispectrum
+        Magnitude of the bispectrum, ``|bispec|``.
 
     bispec_phase : numpy.ndarray
-        Phase of the bispectrum
+        Alias of ``biphase``.
+
+    bispec_err : numpy.ndarray
+        Approximate 1-sigma uncertainty on ``bispec`` (standard error of the
+        mean of the per-segment triple products). Zero for a single segment.
+
+    biphase_err : numpy.ndarray
+        Approximate 1-sigma uncertainty on ``biphase`` from circular statistics
+        (Fisher 1993). Zero for a single segment.
+
+    df : float
+        The frequency resolution.
+
+    m : int
+        The number of averaged bispectra.
+
+    n : int
+        The number of data points in each segment.
+
+    nphots : float
+        The total number of photons (mean per segment).
 
     References
     ----------
-    1) The biphase explained: understanding the asymmetries invcoupled Fourier components of astronomical timeseries
-    by Thomas J. Maccarone Department of Physics, Box 41051, Science Building, Texas Tech University, Lubbock TX 79409-1051
-    School of Physics and Astronomy, University of Southampton, SO16 4ES
+    1) T. J. Maccarone, "The biphase explained: understanding the asymmetries
+       in coupled Fourier components of astronomical time series", MNRAS 435,
+       3547 (2013).
 
-    2) T. S. Rao, M. M. Gabr, An Introduction to Bispectral Analysis and Bilinear Time
-    Series Models, Lecture Notes in Statistics, Volume 24, D. Brillinger, S. Fienberg,
-    J. Gani, J. Hartigan, K. Krickeberg, Editors, Springer-Verlag, New York, NY, 1984.
-
-    3) Matlab version of bispectrum under following link.
-    https://www.mathworks.com/matlabcentral/fileexchange/60-bisp3cum
+    2) Y. C. Kim and E. J. Powers, "Digital Bispectral Analysis and Its
+       Applications to Nonlinear Wave Interactions", IEEE Transactions on
+       Plasma Science, PS-7, 120 (1979).
 
     Examples
     --------
-
-    ::
-
-       >> from stingray.lightcurve import Lightcurve
-       >> from stingray.bispectrum import Bispectrum
-       >> lc = Lightcurve([1,2,3,4,5],[2,3,1,1,2])
-       >> bs = Bispectrum(lc,maxlag=1)
-       >> bs.lags
-       array([-1.,  0.,  1.])
-       >> bs.freq
-       array([-0.5,  0.,  0.5])
-       >> bs.cum3
-       array([[-0.2976,  0.1024,  0.1408],
-           [ 0.1024,  0.144, -0.2976],
-           [ 0.1408, -0.2976,  0.1024]])
-       >> bs.bispec_mag
-       array([[ 1.26336794,  0.0032   ,  0.0032    ],
-           [ 0.0032   ,  0.16     ,  0.0032    ],
-           [ 0.0032   ,  0.0032   ,  1.26336794]])
-       >> bs.bispec_phase
-       array([[ -9.65946229e-01,   2.25347190e-14,   3.46944695e-14],
-           [  0.00000000e+00,   3.14159265e+00,   0.00000000e+00],
-           [ -3.46944695e-14,  -2.25347190e-14,   9.65946229e-01]])
+    >>> lc = Lightcurve(np.arange(64), np.random.default_rng(0).poisson(10, 64))
+    >>> bs = Bispectrum(lc)
+    >>> assert bs.bispec.shape[0] == bs.freq.size
+    >>> assert bs.m == 1
     """
 
-    def __init__(self, lc, maxlag=None, window=None, scale="biased"):
-        # Function call to create Bispectrum Object
-        self._make_bispetrum(lc, maxlag, window, scale)
+    def __init__(
+        self,
+        data=None,
+        dt=None,
+        gti=None,
+        bicoherence_norm="kim_powers",
+        skip_checks=False,
+        lc=None,
+    ):
+        self._type = None
+        if lc is not None:
+            warnings.warn("The lc keyword is now deprecated. Use data instead", DeprecationWarning)
+        if data is None:
+            data = lc
 
-    def _make_bispetrum(self, lc, maxlag, window, scale):
-        """
-        Makes a Bispectrum Object with given lighcurve, maxlag and scale.
+        good_input = data is not None
+        if good_input and not skip_checks:
+            good_input = self.initial_checks(data=data, dt=dt)
 
-        Helper method.
-        """
+        self.dt = dt
+        self.gti = gti
+        self.bicoherence_norm = bicoherence_norm
 
-        if not isinstance(lc, lightcurve.Lightcurve):
-            raise TypeError("lc must be a lightcurve.ightcurve object")
+        if not good_input:
+            return self._initialize_empty()
 
-        # Available Windows. Used to resolve window paramneter
-        WINDOWS = [
-            "uniform",
-            "parzen",
-            "hamming",
-            "hanning",
-            "triangular",
-            "welch",
-            "blackmann",
-            "flat-top",
-        ]
-
-        if window:
-            if not isinstance(window, str):
-                raise TypeError("Window must be specified as string!")
-            window = window.lower()
-            if window not in WINDOWS:
-                raise ValueError("Wrong window specified or window function is not available")
-
-        self.lc = lc
-        self.fs = 1 / lc.dt
-        self.n = self.lc.n
-
-        if maxlag is None:
-            # if maxlag is not specified, it is set to half of length of lightcurve
-            self.maxlag = int(self.lc.n / 2)
-        else:
-            if not (isinstance(maxlag, int)):
-                raise ValueError("maxlag must be an integer")
-
-            # if negative maxlag is entered, convert it to +ve
-            if maxlag < 0:
-                self.maxlag = -maxlag
-            else:
-                self.maxlag = maxlag
-
-        if isinstance(scale, str) is False:
-            raise TypeError("scale must be a string")
-
-        if scale.lower() not in ["biased", "unbiased"]:
-            raise ValueError("scale can only be either 'biased' or 'unbiased'.")
-        self.scale = scale.lower()
-
-        if window is None:
-            self.window_name = "No Window"
-            self.window = None
-        else:
-            self.window_name = window
-            self.window = self._get_window()
-
-        # Other Attributes
-        self.lags = None
-        self.cum3 = None
-        self.freq = None
-        self.bispec = None
-        self.bispec_mag = None
-        self.bispec_phase = None
-
-        # converting to a row vector to apply matrix operations
-        self.signal = np.reshape(lc, (1, len(self.lc.counts)))
-
-        # Mean subtraction before bispecrum calculation
-        self.signal = self.signal - np.mean(lc.counts)
-
-        self._cumulant3()
-        self._normalize_cumulant3()
-        self._cal_bispec()
-
-    def _get_window(self):
-        """
-        Returns a window function of self.window_name type
-        """
-        N = 2 * self.maxlag + 1
-        window_even = utils.create_window(N, self.window_name)
-
-        # 2d even window
-        window2d = np.array(
-            [
-                window_even,
-            ]
-            * N
+        return self._initialize_from_any_input(
+            data, dt=dt, gti=gti, bicoherence_norm=bicoherence_norm
         )
 
-        ## One-sided window with zero padding
-        window = np.zeros(N)
-        window[: self.maxlag + 1] = window_even[self.maxlag :]
-        window[self.maxlag :] = 0
+    def initial_checks(self, data=None, dt=None, segment_size=None):
+        """Run basic checks on the inputs.
 
-        # 2d window function to apply to bispectrum
-        row = np.concatenate(([window[0]], np.zeros(2 * self.maxlag)))
-        toep_matrix = toeplitz(np.ravel(window), np.ravel(row))
-        toep_matrix += np.tril(toep_matrix, -1).transpose()
-        window = toep_matrix[..., ::-1] * window2d * window2d.transpose()
-        return window
-
-    def _cumulant3(self):
+        Returns ``True`` if the input can be used to build a bispectrum,
+        raises otherwise. An empty (``None``) input returns ``False`` so that
+        an empty object is created.
         """
-        Calculates the 3rd Order cummulant of the lightcurve.
+        if data is None:
+            return False
 
-        Assigns
-        -------
-        self.cum3,
-        self.lags
-        """
-        # Initialize square cumulant matrix if zeros
-        cum3_dim = 2 * self.maxlag + 1
-        self.cum3 = np.zeros((cum3_dim, cum3_dim))
-
-        # calculate lags for different values of 3rd order cumulant
-        lagindex = np.arange(-self.maxlag, self.maxlag + 1)
-        self.lags = lagindex * self.lc.dt
-
-        # Defines indices for matrices
-        ind = np.arange((self.n - self.maxlag) - 1, self.n)
-        ind_t = np.arange(self.maxlag, self.n)
-        zero_maxlag = np.zeros((1, self.maxlag))
-        zero_maxlag_t = zero_maxlag.transpose()
-
-        sig = self.signal.transpose()
-
-        rev_signal = np.array([self.signal[0][::-1]])
-        col = np.concatenate((sig[ind], zero_maxlag_t), axis=0)
-        row = np.concatenate((rev_signal[0][ind_t], zero_maxlag[0]), axis=0)
-
-        # converts row and column into a toeplitz matrix
-        toep = toeplitz(np.ravel(col), np.ravel(row))
-        rev_signal = np.repeat(rev_signal, [2 * self.maxlag + 1], axis=0)
-
-        # Calculates Cummulant of 1D signal i.e. Lightcurve counts
-        self.cum3 = self.cum3 + np.matmul(np.multiply(toep, rev_signal), toep.transpose())
-
-    def _normalize_cumulant3(self):
-        """
-        Scales (biased or ubiased) the 3rd Order cumulant of the lightcurve .
-
-        Updates
-        -------
-        seff.cum3
-        """
-
-        # Biased scaling of cummulant
-        if self.scale == "biased":
-            self.cum3 = self.cum3 / self.n
+        if isinstance(data, EventList):
+            if dt is None:
+                raise ValueError(
+                    "If the input is an event list, the time resolution dt " "must be specified."
+                )
+        elif isinstance(data, Lightcurve):
+            pass
+        elif isinstance(data, (tuple, list, Generator)):
+            pass
         else:
-            # unbiased Scaling of cummulant
-            maxlag1 = self.maxlag + 1
+            raise TypeError(f"Bad input to Bispectrum: {type(data)}")
 
-            # Scaling matrix initialized used to do unbiased normalization of cumulant
-            scal_matrix = np.zeros((maxlag1, maxlag1), dtype="int64")
+        if segment_size is not None and dt is not None and segment_size < 2 * dt:
+            raise ValueError("segment_size must be at least 2 * dt.")
 
-            # Calculate scaling matrix for unbiased normalization
-            for k in range(maxlag1):
-                maxlag1k = maxlag1 - (k + 1)
-                scal_matrix[k, k:maxlag1] = np.tile(self.n - maxlag1k, (1, maxlag1k + 1))
-            scal_matrix += np.triu(scal_matrix, k=1).transpose()
+        return True
 
-            maxlag1ind = np.arange(self.maxlag - 1, -1, -1)
-            lagdiff = self.n - maxlag1
+    def _initialize_from_any_input(
+        self,
+        data,
+        dt=None,
+        segment_size=None,
+        gti=None,
+        bicoherence_norm="kim_powers",
+        silent=False,
+        save_all=False,
+    ):
+        """Initialize the object, dispatching on the type of ``data``."""
+        if isinstance(data, EventList):
+            spec = bispectrum_from_events(
+                data,
+                dt,
+                segment_size=segment_size,
+                gti=gti,
+                bicoherence_norm=bicoherence_norm,
+                silent=silent,
+                save_all=save_all,
+            )
+        elif isinstance(data, Lightcurve):
+            spec = bispectrum_from_lightcurve(
+                data,
+                segment_size=segment_size,
+                gti=gti,
+                bicoherence_norm=bicoherence_norm,
+                silent=silent,
+                save_all=save_all,
+            )
+        elif isinstance(data, (tuple, list, Generator)):
+            data = list(data)
+            if len(data) == 0 or not isinstance(data[0], Lightcurve):  # pragma: no cover
+                raise TypeError(f"Bad inputs to Bispectrum: {type(data[0]) if data else None}")
+            dt = data[0].dt
+            spec = bispectrum_from_lc_iterable(
+                data,
+                dt,
+                segment_size=segment_size,
+                gti=gti,
+                bicoherence_norm=bicoherence_norm,
+                silent=silent,
+                save_all=save_all,
+            )
+        else:  # pragma: no cover
+            raise TypeError(f"Bad inputs to Bispectrum: {type(data)}")
 
-            # Rows and columns for Toeplitz matrix
-            col = np.arange(lagdiff, self.n - 1)
-            col = np.reshape(col, (1, len(col))).transpose()
-            row = np.arange(lagdiff, (self.n - 2 * self.maxlag) - 1, -1)
-            row = np.reshape(row, (1, len(row)))
+        for key, val in spec.__dict__.items():
+            setattr(self, key, val)
+        return
 
-            # Toeplitz matrix
-            toep_matrix = toeplitz(np.ravel(col), np.ravel(row))
-            # Matrix used to concatenate with scaling matrix
-            conc_mat = np.array([scal_matrix[self.maxlag, maxlag1ind]])
-            join_matrix = np.concatenate((toep_matrix, conc_mat), axis=0)
-            scal_matrix = np.concatenate((scal_matrix, join_matrix), axis=1)
-            co_mat = scal_matrix[maxlag1ind, :]
-            co_mat = co_mat[:, np.arange(2 * self.maxlag, -1, -1)]
+    def _initialize_empty(self):
+        """Set all attributes to ``None`` (or sensible defaults)."""
+        self.freq = None
+        self.bispec = None
+        self.bicoherence = None
+        self.bicoherence_norm = getattr(self, "bicoherence_norm", "kim_powers")
+        self.biphase = None
+        self.bispec_mag = None
+        self.bispec_phase = None
+        self.bispec_err = None
+        self.biphase_err = None
+        self.valid = None
+        self._bicoh_abs_bispec_sum = None
+        self._bicoh_denom1 = None
+        self._bicoh_denom2 = None
+        self._bicoh_sum_abs = None
+        self.df = None
+        self.dt = None
+        self.m = 1
+        self.n = None
+        self.nphots = None
+        self.segment_size = None
+        self.gti = None
+        return
 
-            # Scaling matrix calculated
-            scal_matrix = np.concatenate((scal_matrix, co_mat), axis=0)
-            # Set numbers less than 1 to be equal to 1
-            scal_matrix[scal_matrix < 1] = 1
-            self.cum3 = np.divide(self.cum3, scal_matrix)
+    def recompute_bicoherence(self, norm, inplace=False):
+        """Recompute the bicoherence under a different normalization.
 
-    def _cal_bispec(self):
-        """
-        Calculates bispectrum as a fourier transform of 3rd Order Cumulant.
-
-        Attributes
-        ----------
-        self.freq
-        self.bispec
-        self.bispec_mag
-        self.bispec_phase
-        """
-        self.freq = (1 / 2) * self.fs * (self.lags / self.lc.dt) / self.maxlag
-
-        # Apply window if specified otherwise calculate with applying window
-        if self.window is None:
-            self.bispec = fftshift(fft2(ifftshift(self.cum3)))
-        else:
-            self.bispec = fftshift(fft2(ifftshift(self.cum3 * self.window)))
-
-        self.bispec_mag = np.abs(self.bispec)
-        self.bispec_phase = np.angle((self.bispec))
-
-    def plot_cum3(self, axis=None, save=False, filename=None):
-        """
-        Plot the 3rd order cumulant as function of time lags using ``matplotlib``.
-        Plot the ``cum3`` attribute on a graph with the ``lags`` attribute on x-axis and y-axis and
-        ``cum3`` on z-axis
-
-        Parameters
-        ----------
-        axis : list, tuple, string, default ``None``
-            Parameter to set axis properties of ``matplotlib`` figure. For example
-            it can be a list like ``[xmin, xmax, ymin, ymax]`` or any other
-            acceptable argument for ``matplotlib.pyplot.axis()`` method.
-
-        save : bool, optionalm, default ``False``
-            If ``True``, save the figure with specified filename.
-
-        filename : str
-            File name and path of the image to save. Depends on the boolean ``save``.
-
-        Returns
-        -------
-        plt : ``matplotlib.pyplot`` object
-            Reference to plot, call ``show()`` to display it
-        """
-        cont = plt.contourf(self.lags, self.lags, self.cum3, 100, cmap=plt.cm.Spectral_r)
-        plt.colorbar(cont)
-        plt.title("3rd Order Cumulant")
-        plt.xlabel("lags 1")
-        plt.ylabel("lags 2")
-
-        if axis is not None:
-            plt.axis(axis)
-
-        if save:
-            if filename is None:
-                plt.savefig("bispec_cum3.png")
-            else:
-                plt.savefig(filename)
-        return plt
-
-    def plot_mag(self, axis=None, save=False, filename=None):
-        """
-        Plot the magnitude of bispectrum as function of freq using ``matplotlib``.
-        Plot the ``bispec_mag`` attribute on a graph with ``freq`` attribute on the x-axis and y-axis and
-        the ``bispec_mag`` attribute on the z-axis.
+        Uses the accumulated bispectrum sums stored on the object, so no FFTs
+        are recomputed. See :class:`Bispectrum` for the definition of each
+        normalization.
 
         Parameters
         ----------
-        axis : list, tuple, string, default ``None``
-            Parameter to set axis properties of ``matplotlib`` figure. For example
-            it can be a list like ``[xmin, xmax, ymin, ymax]`` or any other
-            acceptable argument for ``matplotlib.pyplot.axis()`` method.
+        norm : {"kim_powers", "sigl_chamoun", "hagihira"}
+            The bicoherence normalization.
 
-        save : bool, optional, default ``False``
-            If ``True``, save the figure with specified filename and path.
-
-        filename : str
-            File name and path of the image to save. Depends on the bool ``save``.
+        Other Parameters
+        ----------------
+        inplace : bool, default False
+            If ``True``, also overwrite ``self.bicoherence`` and
+            ``self.bicoherence_norm``.
 
         Returns
         -------
-        plt : ``matplotlib.pyplot`` object
-            Reference to plot, call ``show()`` to display it
+        bicoherence : numpy.ndarray
+            The recomputed bicoherence.
         """
+        if getattr(self, "_bicoh_denom1", None) is None:
+            raise ValueError("This Bispectrum has no data to compute a bicoherence from.")
+        bicoh = bicoherence_from_sums(
+            norm,
+            self._bicoh_abs_bispec_sum,
+            self._bicoh_denom1,
+            self._bicoh_denom2,
+            self._bicoh_sum_abs,
+            valid=self.valid,
+        )
+        if inplace:
+            self.bicoherence = bicoh
+            self.bicoherence_norm = norm.lower()
+        return bicoh
 
-        cont = plt.contourf(self.freq, self.freq, self.bispec_mag, 100, cmap=plt.cm.Spectral_r)
-        plt.colorbar(cont)
-        plt.title("Bispectrum Magnitude")
-        plt.xlabel("freq 1")
-        plt.ylabel("freq 2")
-
-        if axis is not None:
-            plt.axis(axis)
-
-        if save:
-            if filename is None:
-                plt.savefig("bispec_mag.png")
-            else:
-                plt.savefig(filename)
-        return plt
-
-    def plot_phase(self, axis=None, save=False, filename=None):
-        """
-        Plot the phase of bispectrum as function of freq using ``matplotlib``.
-        Plot the ``bispec_phase`` attribute on a graph with ``phase`` attribute on the x-axis and
-        y-axis and the ``bispec_phase`` attribute on the z-axis.
+    @staticmethod
+    def from_lightcurve(lc, gti=None, bicoherence_norm="kim_powers", silent=False):
+        """Calculate a :class:`Bispectrum` from a light curve.
 
         Parameters
         ----------
-        axis : list, tuple, string, default ``None``
-            Parameter to set axis properties of ``matplotlib`` figure. For example
-            it can be a list like ``[xmin, xmax, ymin, ymax]`` or any other
-            acceptable argument for ``matplotlib.pyplot.axis()`` function.
+        lc : :class:`stingray.Lightcurve`
+            Light curve to be analyzed.
 
-        save : bool, optional, default ``False``
-            If ``True``, save the figure with specified filename and path.
+        Other Parameters
+        ----------------
+        gti : ``[[gti0_0, gti0_1], ...]``
+            Good time intervals.
+        bicoherence_norm : {"kim_powers", "sigl_chamoun", "hagihira"}, default "kim_powers"
+            The bicoherence normalization (see :class:`Bispectrum`).
+        silent : bool, default False
+            Silence the progress bars.
+        """
+        return bispectrum_from_lightcurve(
+            lc, gti=gti, bicoherence_norm=bicoherence_norm, silent=silent
+        )
 
-        filename : str
-            File name and path of the image to save. Depends on the bool ``save``.
+    @staticmethod
+    def from_events(events, dt, gti=None, bicoherence_norm="kim_powers", silent=False):
+        """Calculate a :class:`Bispectrum` from an event list.
+
+        Parameters
+        ----------
+        events : :class:`stingray.EventList`
+            Event list to be analyzed.
+        dt : float
+            The time resolution of the intermediate light curve (sets the
+            Nyquist frequency).
+
+        Other Parameters
+        ----------------
+        gti : ``[[gti0_0, gti0_1], ...]``
+            Good time intervals.
+        bicoherence_norm : {"kim_powers", "sigl_chamoun", "hagihira"}, default "kim_powers"
+            The bicoherence normalization (see :class:`Bispectrum`).
+        silent : bool, default False
+            Silence the progress bars.
+        """
+        return bispectrum_from_events(
+            events, dt, gti=gti, bicoherence_norm=bicoherence_norm, silent=silent
+        )
+
+    @staticmethod
+    def from_time_array(times, dt, gti=None, bicoherence_norm="kim_powers", silent=False):
+        """Calculate a :class:`Bispectrum` from an array of event times.
+
+        Parameters
+        ----------
+        times : `np.array`
+            Event arrival times.
+        dt : float
+            The time resolution of the intermediate light curve.
+
+        Other Parameters
+        ----------------
+        gti : ``[[gti0_0, gti0_1], ...]``
+            Good time intervals.
+        bicoherence_norm : {"kim_powers", "sigl_chamoun", "hagihira"}, default "kim_powers"
+            The bicoherence normalization (see :class:`Bispectrum`).
+        silent : bool, default False
+            Silence the progress bars.
+        """
+        return bispectrum_from_time_array(
+            times, dt, gti=gti, bicoherence_norm=bicoherence_norm, silent=silent
+        )
+
+    @staticmethod
+    def from_stingray_timeseries(
+        ts, flux_attr, error_flux_attr=None, gti=None, bicoherence_norm="kim_powers", silent=False
+    ):
+        """Calculate a :class:`Bispectrum` from a time series.
+
+        Parameters
+        ----------
+        ts : :class:`stingray.StingrayTimeseries`
+            Input time series.
+        flux_attr : str
+            The attribute of the time series to use as flux.
+
+        Other Parameters
+        ----------------
+        error_flux_attr : str
+            The attribute of the time series to use as error bar.
+        gti : ``[[gti0_0, gti0_1], ...]``
+            Good time intervals.
+        bicoherence_norm : {"kim_powers", "sigl_chamoun", "hagihira"}, default "kim_powers"
+            The bicoherence normalization (see :class:`Bispectrum`).
+        silent : bool, default False
+            Silence the progress bars.
+        """
+        return bispectrum_from_stingray_timeseries(
+            ts,
+            flux_attr,
+            error_flux_attr=error_flux_attr,
+            gti=gti,
+            bicoherence_norm=bicoherence_norm,
+            silent=silent,
+        )
+
+    def plot_mag(self, ax=None, save=False, filename=None):
+        """Plot the magnitude of the bispectrum as a function of frequency.
+
+        Parameters
+        ----------
+        ax : ``matplotlib.axes.Axes``, default ``None``
+            The axes to plot onto. A new one is created if ``None``.
+        save : bool, default ``False``
+            If ``True``, save the figure to ``filename``.
+        filename : str, default ``None``
+            File name to save the figure to. Defaults to ``bispec_mag.png``.
 
         Returns
         -------
-        plt : ``matplotlib.pyplot`` object
-            Reference to plot, call ``show()`` to display it
+        ax : ``matplotlib.axes.Axes``
+            The axes with the plot.
         """
+        return self._plot_matrix(
+            self.bispec_mag, "Bispectrum Magnitude", ax, save, filename, "bispec_mag.png"
+        )
 
-        cont = plt.contourf(self.freq, self.freq, self.bispec_phase, 100, cmap=plt.cm.Spectral_r)
-        plt.colorbar(cont)
-        plt.title("Bispectrum Phase")
-        plt.xlabel("freq 1")
-        plt.ylabel("freq 2")
+    def plot_phase(self, ax=None, save=False, filename=None):
+        """Plot the biphase as a function of frequency.
 
-        if axis is not None:
-            plt.axis(axis)
+        Parameters
+        ----------
+        ax : ``matplotlib.axes.Axes``, default ``None``
+            The axes to plot onto. A new one is created if ``None``.
+        save : bool, default ``False``
+            If ``True``, save the figure to ``filename``.
+        filename : str, default ``None``
+            File name to save the figure to. Defaults to ``bispec_phase.png``.
 
-        # Save figure
+        Returns
+        -------
+        ax : ``matplotlib.axes.Axes``
+            The axes with the plot.
+        """
+        return self._plot_matrix(self.biphase, "Biphase", ax, save, filename, "bispec_phase.png")
+
+    def plot_bicoherence(self, ax=None, save=False, filename=None):
+        """Plot the bicoherence as a function of frequency.
+
+        Parameters
+        ----------
+        ax : ``matplotlib.axes.Axes``, default ``None``
+            The axes to plot onto. A new one is created if ``None``.
+        save : bool, default ``False``
+            If ``True``, save the figure to ``filename``.
+        filename : str, default ``None``
+            File name to save the figure to. Defaults to ``bicoherence.png``.
+
+        Returns
+        -------
+        ax : ``matplotlib.axes.Axes``
+            The axes with the plot.
+        """
+        return self._plot_matrix(
+            self.bicoherence, "Bicoherence", ax, save, filename, "bicoherence.png"
+        )
+
+    def _plot_matrix(self, matrix, title, ax, save, filename, default_filename):
+        """Shared helper for the 2D bispectrum plots."""
+        if matrix is None:
+            raise ValueError("This Bispectrum has no data to plot.")
+
+        if ax is None:
+            _, ax = plt.subplots()
+
+        cont = ax.contourf(self.freq, self.freq, matrix, 100, cmap=plt.cm.Spectral_r)
+        ax.figure.colorbar(cont, ax=ax)
+        ax.set_title(title)
+        ax.set_xlabel("Frequency 1 (Hz)")
+        ax.set_ylabel("Frequency 2 (Hz)")
+
         if save:
-            if filename is None:
-                plt.savefig("bispec_phase.png")
+            ax.figure.savefig(filename if filename is not None else default_filename)
+        return ax
+
+
+class AveragedBispectrum(Bispectrum):
+    type = "bispectrum"
+
+    r"""Make an averaged bispectrum from a light curve or event list.
+
+    The light curve is split into segments of length ``segment_size``, a
+    bispectrum is computed for each segment, and the results are averaged (see
+    :class:`Bispectrum` for the estimator definition). Averaging is what makes
+    the bicoherence and biphase statistically meaningful.
+
+    Parameters
+    ----------
+    data : :class:`stingray.Lightcurve`, iterable of :class:`stingray.Lightcurve`, or :class:`stingray.events.EventList`
+        The light curve data to be Fourier-transformed.
+
+    segment_size : float
+        The size, in seconds, of each segment to average. If the total duration
+        is not an integer multiple of ``segment_size``, the leftover at the end
+        is discarded.
+
+    Other Parameters
+    ----------------
+    gti : 2-d float array
+        ``[[gti0_0, gti0_1], ...]`` -- Good time intervals.
+
+    dt : float
+        The time resolution of the light curve. Only needed when the input is
+        an :class:`EventList`.
+
+    silent : bool, default False
+        Do not show a progress bar.
+
+    save_all : bool, default False
+        Save all intermediate bispectra used for the final average (under
+        ``bispec_all``). Use with care; this can fill up RAM.
+
+    skip_checks : bool, default False
+        Skip initial checks, for speed or other reasons (you need to trust your
+        inputs!).
+
+    lc : :class:`stingray.Lightcurve`, optional
+        For backwards compatibility only. Deprecated; use ``data``.
+
+    Attributes
+    ----------
+    See :class:`Bispectrum`. In addition:
+
+    segment_size : float
+        The size of each averaged segment.
+
+    bispec_all : list of numpy.ndarray
+        Only present if ``save_all=True``: the per-segment bispectra.
+    """
+
+    def __init__(
+        self,
+        data=None,
+        segment_size=None,
+        gti=None,
+        dt=None,
+        bicoherence_norm="kim_powers",
+        silent=False,
+        save_all=False,
+        skip_checks=False,
+        lc=None,
+    ):
+        self._type = None
+        if lc is not None:
+            warnings.warn("The lc keyword is now deprecated. Use data instead", DeprecationWarning)
+        if data is None:
+            data = lc
+
+        good_input = data is not None
+        if good_input and not skip_checks:
+            good_input = self.initial_checks(data=data, dt=dt, segment_size=segment_size)
+
+        self.dt = dt
+        self.gti = gti
+        self.bicoherence_norm = bicoherence_norm
+        self.segment_size = segment_size
+        self.save_all = save_all
+
+        if not good_input:
+            return self._initialize_empty()
+
+        if isinstance(data, Generator):
+            warnings.warn(
+                "The averaged bispectrum from a generator of light curves "
+                "pre-allocates the full list of light curves, losing the "
+                "advantage of lazy loading. If that matters to you, use the "
+                "AveragedBispectrum.from_lc_iterable static method, specifying "
+                "the sampling time dt."
+            )
+            data = list(data)
+
+        return self._initialize_from_any_input(
+            data,
+            dt=dt,
+            segment_size=segment_size,
+            gti=gti,
+            bicoherence_norm=bicoherence_norm,
+            silent=silent,
+            save_all=save_all,
+        )
+
+    def initial_checks(self, data=None, dt=None, segment_size=None):
+        if data is not None and segment_size is None:
+            raise ValueError("segment_size must be specified for an AveragedBispectrum.")
+        return super().initial_checks(data=data, dt=dt, segment_size=segment_size)
+
+    @staticmethod
+    def from_lightcurve(
+        lc, segment_size, gti=None, bicoherence_norm="kim_powers", silent=False, save_all=False
+    ):
+        """Calculate an :class:`AveragedBispectrum` from a light curve."""
+        return bispectrum_from_lightcurve(
+            lc,
+            segment_size=segment_size,
+            gti=gti,
+            bicoherence_norm=bicoherence_norm,
+            silent=silent,
+            save_all=save_all,
+        )
+
+    @staticmethod
+    def from_events(
+        events,
+        dt,
+        segment_size,
+        gti=None,
+        bicoherence_norm="kim_powers",
+        silent=False,
+        save_all=False,
+    ):
+        """Calculate an :class:`AveragedBispectrum` from an event list."""
+        return bispectrum_from_events(
+            events,
+            dt,
+            segment_size=segment_size,
+            gti=gti,
+            bicoherence_norm=bicoherence_norm,
+            silent=silent,
+            save_all=save_all,
+        )
+
+    @staticmethod
+    def from_time_array(
+        times,
+        dt,
+        segment_size,
+        gti=None,
+        bicoherence_norm="kim_powers",
+        silent=False,
+        save_all=False,
+    ):
+        """Calculate an :class:`AveragedBispectrum` from an array of event times."""
+        return bispectrum_from_time_array(
+            times,
+            dt,
+            segment_size=segment_size,
+            gti=gti,
+            bicoherence_norm=bicoherence_norm,
+            silent=silent,
+            save_all=save_all,
+        )
+
+    @staticmethod
+    def from_stingray_timeseries(
+        ts,
+        flux_attr,
+        segment_size,
+        error_flux_attr=None,
+        gti=None,
+        bicoherence_norm="kim_powers",
+        silent=False,
+        save_all=False,
+    ):
+        """Calculate an :class:`AveragedBispectrum` from a time series."""
+        return bispectrum_from_stingray_timeseries(
+            ts,
+            flux_attr,
+            error_flux_attr=error_flux_attr,
+            segment_size=segment_size,
+            gti=gti,
+            bicoherence_norm=bicoherence_norm,
+            silent=silent,
+            save_all=save_all,
+        )
+
+    @staticmethod
+    def from_lc_iterable(
+        iter_lc,
+        dt,
+        segment_size,
+        gti=None,
+        bicoherence_norm="kim_powers",
+        silent=False,
+        save_all=False,
+    ):
+        """Calculate an :class:`AveragedBispectrum` from an iterable of light curves."""
+        return bispectrum_from_lc_iterable(
+            iter_lc,
+            dt,
+            segment_size=segment_size,
+            gti=gti,
+            bicoherence_norm=bicoherence_norm,
+            silent=silent,
+            save_all=save_all,
+        )
+
+
+def _create_bispectrum_from_result_table(table, force_averaged=False):
+    """Populate a :class:`Bispectrum` or :class:`AveragedBispectrum` from a
+    result table produced by ``stingray.fourier.avg_bispectrum_from_XX``.
+    """
+    if table is None:  # pragma: no cover
+        raise ValueError("No usable segments were found to compute the bispectrum.")
+
+    if table.meta["m"] > 1 or force_averaged:
+        bs = AveragedBispectrum()
+    else:
+        bs = Bispectrum()
+
+    bs.freq = np.asarray(table.meta["freq"])
+    bs.bispec = table.meta["bispec"]
+    bs.bicoherence = table.meta["bicoherence"]
+    bs.bicoherence_norm = table.meta["bicoherence_norm"]
+    bs.biphase = table.meta["biphase"]
+    bs.bispec_err = table.meta["bispec_err"]
+    bs.biphase_err = table.meta["biphase_err"]
+    bs.valid = table.meta["valid"]
+    bs.bispec_mag = np.abs(bs.bispec)
+    bs.bispec_phase = bs.biphase
+
+    # Raw accumulated sums, kept so the bicoherence can be recomputed under a
+    # different normalization via ``recompute_bicoherence`` without redoing FFTs.
+    bs._bicoh_abs_bispec_sum = table.meta["bicoh_abs_bispec_sum"]
+    bs._bicoh_denom1 = table.meta["bicoh_denom1"]
+    bs._bicoh_denom2 = table.meta["bicoh_denom2"]
+    bs._bicoh_sum_abs = table.meta["bicoh_sum_abs"]
+
+    for attr in ["n", "m", "dt", "df", "nphots", "segment_size", "gti"]:
+        if attr in table.meta:
+            setattr(bs, attr, table.meta[attr])
+
+    if "subbs" in table.meta:
+        bs.bispec_all = table.meta["subbs"]
+
+    return bs
+
+
+def bispectrum_from_time_array(
+    times,
+    dt,
+    segment_size=None,
+    gti=None,
+    bicoherence_norm="kim_powers",
+    silent=False,
+    save_all=False,
+):
+    """Calculate a bispectrum from an array of event times.
+
+    Parameters
+    ----------
+    times : `np.array`
+        Event arrival times.
+    dt : float
+        The time resolution of the intermediate light curves.
+
+    Other Parameters
+    ----------------
+    segment_size : float
+        The length, in seconds, of the light curve segments to average. Only
+        relevant (and required) for an :class:`AveragedBispectrum`.
+    gti : ``[[gti0_0, gti0_1], ...]``
+        Good time intervals.
+    bicoherence_norm : {"kim_powers", "sigl_chamoun", "hagihira"}, default "kim_powers"
+        The bicoherence normalization (see :class:`Bispectrum`).
+    silent : bool, default False
+        Silence the progress bars.
+    save_all : bool, default False
+        Save all intermediate bispectra used for the final average.
+
+    Returns
+    -------
+    spec : :class:`AveragedBispectrum` or :class:`Bispectrum`
+        The output bispectrum.
+    """
+    force_averaged = segment_size is not None
+    silent = silent or (segment_size is None)
+    table = avg_bispectrum_from_timeseries(
+        times,
+        gti,
+        segment_size,
+        dt,
+        bicoherence_norm=bicoherence_norm,
+        silent=silent,
+        return_subbs=save_all,
+    )
+    return _create_bispectrum_from_result_table(table, force_averaged=force_averaged)
+
+
+def bispectrum_from_events(
+    events,
+    dt,
+    segment_size=None,
+    gti=None,
+    bicoherence_norm="kim_powers",
+    silent=False,
+    save_all=False,
+):
+    """Calculate a bispectrum from an event list. See
+    `bispectrum_from_time_array` for the parameters."""
+    if gti is None:
+        gti = events.gti
+    dt = events.suggest_compatible_dt(dt)
+    return bispectrum_from_time_array(
+        events.time,
+        dt,
+        segment_size=segment_size,
+        gti=gti,
+        bicoherence_norm=bicoherence_norm,
+        silent=silent,
+        save_all=save_all,
+    )
+
+
+def bispectrum_from_lightcurve(
+    lc, segment_size=None, gti=None, bicoherence_norm="kim_powers", silent=False, save_all=False
+):
+    """Calculate a bispectrum from a light curve. See
+    `bispectrum_from_time_array` for the parameters."""
+    force_averaged = segment_size is not None
+    silent = silent or (segment_size is None)
+    if gti is None:
+        gti = lc.gti
+    err = None
+    if lc.err_dist == "gauss":
+        err = lc.counts_err
+    table = avg_bispectrum_from_timeseries(
+        lc.time,
+        gti,
+        segment_size,
+        lc.dt,
+        bicoherence_norm=bicoherence_norm,
+        silent=silent,
+        fluxes=lc.counts,
+        errors=err,
+        return_subbs=save_all,
+    )
+    return _create_bispectrum_from_result_table(table, force_averaged=force_averaged)
+
+
+def bispectrum_from_stingray_timeseries(
+    ts,
+    flux_attr,
+    error_flux_attr=None,
+    segment_size=None,
+    gti=None,
+    bicoherence_norm="kim_powers",
+    silent=False,
+    save_all=False,
+):
+    """Calculate a bispectrum from a time series. See
+    `bispectrum_from_time_array` for the parameters."""
+    force_averaged = segment_size is not None
+    silent = silent or (segment_size is None)
+    if gti is None:
+        gti = ts.gti
+    err = None
+    if error_flux_attr is not None:
+        err = getattr(ts, error_flux_attr)
+    table = avg_bispectrum_from_timeseries(
+        ts.time,
+        gti,
+        segment_size,
+        ts.dt,
+        bicoherence_norm=bicoherence_norm,
+        silent=silent,
+        fluxes=getattr(ts, flux_attr),
+        errors=err,
+        return_subbs=save_all,
+    )
+    return _create_bispectrum_from_result_table(table, force_averaged=force_averaged)
+
+
+def bispectrum_from_lc_iterable(
+    iter_lc,
+    dt,
+    segment_size=None,
+    gti=None,
+    bicoherence_norm="kim_powers",
+    silent=False,
+    save_all=False,
+):
+    """Calculate an average bispectrum from an iterable of light curves.
+
+    Parameters
+    ----------
+    iter_lc : iterable of :class:`stingray.Lightcurve` or `np.array`
+        Light curves. If arrays, they are used as counts.
+    dt : float
+        The time resolution of the light curves.
+
+    Other Parameters
+    ----------------
+    segment_size : float, default None
+        The length, in seconds, of the light curve segments to average.
+    gti : ``[[gti0_0, gti0_1], ...]``
+        Good time intervals.
+    silent : bool, default False
+        Silence the progress bars.
+    save_all : bool, default False
+        Save all intermediate bispectra used for the final average.
+
+    Returns
+    -------
+    spec : :class:`AveragedBispectrum` or :class:`Bispectrum`
+        The output bispectrum.
+    """
+    force_averaged = segment_size is not None
+    silent = silent or (segment_size is None)
+    common_gti = gti
+
+    def iterate_lc_counts(iter_lc):
+        for lc in iter_lc:
+            if hasattr(lc, "counts"):
+                n_bin = (
+                    np.rint(segment_size / lc.dt).astype(int) if segment_size else lc.counts.size
+                )
+                lc_gti = lc.gti
+                if common_gti is not None:
+                    lc_gti = cross_two_gtis(common_gti, lc.gti)
+                err = None
+                if lc.err_dist == "gauss":
+                    err = lc.counts_err
+                flux_iterable = get_flux_iterable_from_segments(
+                    lc.time, lc_gti, segment_size, n_bin, fluxes=lc.counts, errors=err
+                )
+                for out in flux_iterable:
+                    yield out
+            elif isinstance(lc, Iterable):
+                yield lc
             else:
-                plt.savefig(filename)
-        return plt
+                raise TypeError(
+                    "The inputs to bispectrum_from_lc_iterable must be "
+                    "Lightcurve objects or arrays."
+                )
+
+    table = avg_bispectrum_from_iterable(
+        iterate_lc_counts(iter_lc),
+        dt,
+        bicoherence_norm=bicoherence_norm,
+        silent=silent,
+        return_subbs=save_all,
+    )
+    return _create_bispectrum_from_result_table(table, force_averaged=force_averaged)
