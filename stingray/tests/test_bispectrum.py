@@ -1,850 +1,543 @@
-import numpy as np
-
-import pytest
-import warnings
 import os
+import copy
 
-from stingray import Lightcurve
-from stingray.bispectrum import Bispectrum
-from stingray.exceptions import StingrayError
-
+import numpy as np
+import pytest
 import matplotlib.pyplot as plt
 
+from stingray import Lightcurve, EventList, StingrayTimeseries
+from stingray.bispectrum import Bispectrum, AveragedBispectrum
+from stingray.fourier import (
+    fftfreq,
+    positive_fft_bins,
+    avg_bispectrum_from_iterable,
+    avg_bispectrum_from_timeseries,
+    bicoherence_from_sums,
+    _bispectrum_frequency_grid,
+)
 
-def allclose_with_wrap(array1, array2):
-    """Calculates if numbers are all close, considering -pi = pi."""
-    for a1, a2 in zip(array1.flatten(), array2.flatten()):
-        condition = np.isclose(a1, a2)
-        if np.isclose(a1, np.pi) or np.isclose(a1, -np.pi):
-            condition = condition or np.isclose(a1, -a2)
+BICOHERENCE_NORMS = ("kim_powers", "sigl_chamoun", "hagihira")
 
-        if not condition:
-            return False
-    return True
+def clear_all_figs():
+    fign = plt.get_fignums()
+    for fig in fign:
+        plt.close(fig)
+
+
+rng = np.random.RandomState(20150907)
+
+curdir = os.path.abspath(os.path.dirname(__file__))
+datadir = os.path.join(curdir, "data")
+
+
+def _brute_force_bispectrum(segments, n_bin):
+    """Reference bispectrum and the three bicoherence normalizations.
+
+    A direct, slow, double-loop implementation of the Maccarone (2013)
+    estimator, used to validate the vectorized ``avg_bispectrum_*`` functions.
+    """
+    fgt0 = positive_fft_bins(n_bin)
+    kbins = np.arange(fgt0.start, fgt0.stop)
+    nf = len(kbins)
+    nyq = n_bin // 2
+    num = np.zeros((nf, nf), dtype=complex)
+    den1 = np.zeros((nf, nf))
+    den2 = np.zeros((nf, nf))
+    sum_abs = np.zeros((nf, nf))
+    valid = np.zeros((nf, nf), dtype=bool)
+    for s in segments:
+        ft = np.fft.fft(np.asarray(s))
+        for a, ka in enumerate(kbins):
+            for b, kb in enumerate(kbins):
+                if ka + kb > nyq:
+                    continue
+                valid[a, b] = True
+                t = ft[ka] * ft[kb] * np.conj(ft[ka + kb])
+                num[a, b] += t
+                den1[a, b] += np.abs(ft[ka] * ft[kb]) ** 2
+                den2[a, b] += np.abs(ft[ka + kb]) ** 2
+                sum_abs[a, b] += np.abs(t)
+    k = len(segments)
+    bispec = np.full((nf, nf), np.nan, dtype=complex)
+    norms = {n: np.full((nf, nf), np.nan) for n in BICOHERENCE_NORMS}
+    bispec[valid] = num[valid] / k
+    norms["kim_powers"][valid] = np.abs(num[valid]) ** 2 / (den1[valid] * den2[valid])
+    norms["sigl_chamoun"][valid] = np.abs(num[valid]) / np.sqrt(den1[valid] * den2[valid])
+    norms["hagihira"][valid] = np.abs(num[valid]) / sum_abs[valid]
+    return bispec, norms, valid
+
+
+def _coupled_segments(rng_local, n_seg, n_bin, dt, f1, f2, couple=True):
+    """Segments with (optionally) quadratic phase coupling of f1, f2 -> f1+f2."""
+    t = np.arange(n_bin) * dt
+    segs = []
+    for _ in range(n_seg):
+        p1, p2 = rng_local.uniform(0, 2 * np.pi, size=2)
+        p3 = p1 + p2 if couple else rng_local.uniform(0, 2 * np.pi)
+        s = (
+            np.cos(2 * np.pi * f1 * t + p1)
+            + np.cos(2 * np.pi * f2 * t + p2)
+            + np.cos(2 * np.pi * (f1 + f2) * t + p3)
+            + 20
+        )
+        segs.append(s)
+    return segs
 
 
 class TestBispectrum(object):
     @classmethod
     def setup_class(cls):
-        cls.lc = Lightcurve([1, 2, 3, 4, 5], [2, 3, 2, 4, 1])
-        cls.lc1 = Lightcurve([0.5, 1.0, 1.5, 2.0, 2.5, 3.0], [2, 1, 3, 1, 4, 2])
+        cls.dt = 0.1
+        cls.n = 256
+        cls.time = np.arange(cls.n) * cls.dt
+        cls.counts = rng.poisson(50, cls.n).astype(float)
+        cls.lc = Lightcurve(cls.time, cls.counts, dt=cls.dt, skip_checks=True)
+        cls.events = EventList(
+            np.sort(rng.uniform(0, cls.n * cls.dt, 5000)), gti=[[0, cls.n * cls.dt]]
+        )
+        cls.bs = Bispectrum(cls.lc)
 
-    def test_create_bispectrum(self):
-        """
-        Demonstrate that we can create a Bispectrum object.
-        """
-        Bispectrum(self.lc)
+    @pytest.mark.parametrize("skip_checks", [True, False])
+    def test_initialize_empty(self, skip_checks):
+        bs = Bispectrum(skip_checks=skip_checks)
+        assert bs.freq is None
+        assert bs.bispec is None
+        assert bs.m == 1
 
-    def test_wrong_lc(self):
-        lc = [1, 2, 3, 4]
-        with pytest.raises(TypeError):
-            Bispectrum(lc)
+    def test_make_empty_bispectrum(self):
+        bs = Bispectrum()
+        assert bs.bicoherence is None
+        assert bs.biphase is None
+        assert bs.bispec_mag is None
 
-    def test_wrong_maxlag(self):
-        with pytest.raises(ValueError):
-            Bispectrum(self.lc, maxlag="123")
-
-    def test_maxlag_none(self):
+    def test_make_bispectrum_from_lightcurve(self):
         bs = Bispectrum(self.lc)
-        assert bs.maxlag == int(self.lc.n / 2)
+        assert isinstance(bs, Bispectrum)
+        assert bs.m == 1
+        assert bs.n == self.n
 
-    def test_neg_maxlag(self):
-        bs = Bispectrum(self.lc, maxlag=-2)
-        assert bs.maxlag == 2
+    def test_bispectrum_types(self):
+        assert self.bs.type == "bispectrum"
 
-    def test_bispectrum_with_none_maxlag(self):
-        bs = Bispectrum(self.lc)
-        lags = np.array([-2, -1, 0, 1, 2])
-        freq = np.array([-0.5, -0.25, 0.0, 0.25, 0.5])
-        cum3 = np.array(
-            [
-                [0.0576, 0.1216, 0.1376, -0.2176, -0.0448],
-                [0.1216, -0.6752, 0.4128, 0.1216, -0.0096],
-                [0.1376, 0.4128, 0.288, -0.6752, 0.0576],
-                [-0.2176, 0.1216, -0.6752, 0.4128, 0.1216],
-                [-0.0448, -0.0096, 0.0576, 0.1216, 0.1376],
-            ]
-        )
+    def test_type_change(self):
+        bs = copy.deepcopy(self.bs)
+        assert bs.type == "bispectrum"
+        bs.type = "astdfawerfsaf"
+        assert bs.type == "astdfawerfsaf"
 
-        bispec = np.array(
-            [
-                [
-                    1.26572936 - 1.96410531e00j,
-                    1.01680863 - 2.33088331e00j,
-                    0.53357150 - 3.20079088e-01j,
-                    -0.39280863 + 1.79793854e00j,
-                    0.37973002 + 0.00000000e00j,
-                ],
-                [
-                    1.01680863 - 2.33088331e00j,
-                    -0.29772936 - 1.20447928e00j,
-                    -0.11757150 - 7.55604229e-02j,
-                    0.03626998 + 1.11022302e-16j,
-                    -0.39280863 - 1.79793854e00j,
-                ],
-                [
-                    0.53357150 - 3.20079088e-01j,
-                    -0.11757150 - 7.55604229e-02j,
-                    0.27200000 + 0.00000000e00j,
-                    -0.11757150 + 7.55604229e-02j,
-                    0.53357150 + 3.20079088e-01j,
-                ],
-                [
-                    -0.39280863 + 1.79793854e00j,
-                    0.03626998 - 1.11022302e-16j,
-                    -0.11757150 + 7.55604229e-02j,
-                    -0.29772936 + 1.20447928e00j,
-                    1.01680863 + 2.33088331e00j,
-                ],
-                [
-                    0.37973002 + 0.00000000e00j,
-                    -0.39280863 - 1.79793854e00j,
-                    0.53357150 + 3.20079088e-01j,
-                    1.01680863 + 2.33088331e00j,
-                    1.26572936 + 1.96410531e00j,
-                ],
-            ]
-        )
+    def test_shapes(self):
+        nf = self.bs.freq.size
+        assert self.bs.bispec.shape == (nf, nf)
+        assert self.bs.bicoherence.shape == (nf, nf)
+        assert self.bs.biphase.shape == (nf, nf)
+        assert self.bs.bispec_mag.shape == (nf, nf)
+        assert self.bs.bispec_err.shape == (nf, nf)
 
-        bispec_mag = np.array(
-            [
-                [2.33661732, 2.54301333, 0.62221312, 1.84034823, 0.37973002],
-                [2.54301333, 1.24073087, 0.13975849, 0.03626998, 1.84034823],
-                [0.62221312, 0.13975849, 0.272, 0.13975849, 0.62221312],
-                [1.84034823, 0.03626998, 0.13975849, 1.24073087, 2.54301333],
-                [0.37973002, 1.84034823, 0.62221312, 2.54301333, 2.33661732],
-            ]
-        )
-
-        bispec_phase = np.array(
-            [
-                [-9.98346367e-01, -1.15944968e00, -5.40331561e-01, 1.78589369e00, 0.00000000e00],
-                [-1.15944968e00, -1.81312395e00, -2.57038310e00, 3.06099713e-15, -1.78589369e00],
-                [-5.40331561e-01, -2.57038310e00, 0.00000000e00, 2.57038310e00, 5.40331561e-01],
-                [1.78589369e00, -3.06099713e-15, 2.57038310e00, 1.81312395e00, 1.15944968e00],
-                [0.00000000e00, -1.78589369e00, 5.40331561e-01, 1.15944968e00, 9.98346367e-01],
-            ]
-        )
-        assert bs.lc == self.lc
-        assert np.isclose(bs.fs, 1)
-        assert bs.maxlag == 2
-        assert bs.n == 5
-        assert bs.scale == "biased"
-        assert np.allclose(bs.lags, lags)
-        assert np.allclose(bs.freq, freq)
-        assert np.allclose(bs.cum3, cum3)
-        assert np.allclose(bs.bispec, bispec)
-        assert np.allclose(bs.bispec_mag, bispec_mag)
-        assert allclose_with_wrap(bs.bispec_phase, bispec_phase)
-
-    def test_wrong_scale_type(self):
+    def test_init_without_lightcurve(self):
         with pytest.raises(TypeError):
-            Bispectrum(self.lc, scale=1)
+            Bispectrum(self.lc.counts)
 
-    def test_wrong_scale_value(self):
-        with pytest.raises(ValueError):
-            Bispectrum(self.lc, scale="non-biased")
-
-    def test_bispectrum_unbiased_scale(self):
-        bs = Bispectrum(self.lc, scale="unbiased")
-
-        lags = np.array([-2, -1, 0, 1, 2])
-        freq = np.array([-0.5, -0.25, 0.0, 0.25, 0.5])
-
-        cum3 = np.array(
-            [
-                [0.096, 0.20266667, 0.22933333, -0.544, -0.224],
-                [0.20266667, -0.844, 0.516, 0.20266667, -0.024],
-                [0.22933333, 0.516, 0.288, -0.844, 0.096],
-                [-0.544, 0.20266667, -0.844, 0.516, 0.20266667],
-                [-0.224, -0.024, 0.096, 0.20266667, 0.22933333],
-            ]
-        )
-
-        bispec = np.array(
-            [
-                [
-                    1.78211085 - 2.10567238e00j,
-                    1.56502881 - 3.02261738e00j,
-                    0.63208770 - 8.00197720e-01j,
-                    -1.20769548 + 2.56558544e00j,
-                    0.49792363 + 2.22044605e-16j,
-                ],
-                [
-                    1.56502881 - 3.02261738e00j,
-                    -1.12477752 - 1.08193727e00j,
-                    0.12524563 - 1.88901057e-01j,
-                    0.25940971 + 2.22044605e-16j,
-                    -1.20769548 - 2.56558544e00j,
-                ],
-                [
-                    0.63208770 - 8.00197720e-01j,
-                    0.12524563 - 1.88901057e-01j,
-                    -0.08800000 + 0.00000000e00j,
-                    0.12524563 + 1.88901057e-01j,
-                    0.63208770 + 8.00197720e-01j,
-                ],
-                [
-                    -1.20769548 + 2.56558544e00j,
-                    0.25940971 - 2.22044605e-16j,
-                    0.12524563 + 1.88901057e-01j,
-                    -1.12477752 + 1.08193727e00j,
-                    1.56502881 + 3.02261738e00j,
-                ],
-                [
-                    0.49792363 - 2.22044605e-16j,
-                    -1.20769548 - 2.56558544e00j,
-                    0.63208770 + 8.00197720e-01j,
-                    1.56502881 + 3.02261738e00j,
-                    1.78211085 + 2.10567238e00j,
-                ],
-            ]
-        )
-
-        bispec_mag = np.array(
-            [
-                [2.75858211, 3.40375249, 1.01973097, 2.83562286, 0.49792363],
-                [3.40375249, 1.56067701, 0.22664968, 0.25940971, 2.83562286],
-                [1.01973097, 0.22664968, 0.088, 0.22664968, 1.01973097],
-                [2.83562286, 0.25940971, 0.22664968, 1.56067701, 3.40375249],
-                [0.49792363, 2.83562286, 1.01973097, 3.40375249, 2.75858211],
-            ]
-        )
-
-        bispec_phase = np.array(
-            [
-                [-8.68432005e-01, -1.09303185e00, -9.02235465e-01, 2.01075415e00, 4.45941091e-16],
-                [-1.09303185e00, -2.37560564e00, -9.85320934e-01, 8.55961046e-16, -2.01075415e00],
-                [-9.02235465e-01, -9.85320934e-01, 3.14159265e00, 9.85320934e-01, 9.02235465e-01],
-                [2.01075415e00, -8.55961046e-16, 9.85320934e-01, 2.37560564e00, 1.09303185e00],
-                [-4.45941091e-16, -2.01075415e00, 9.02235465e-01, 1.09303185e00, 8.68432005e-01],
-            ]
-        )
-
-        assert bs.lc == self.lc
-        assert np.isclose(bs.fs, 1)
-        assert bs.maxlag == 2
-        assert bs.n == 5
-        assert bs.scale == "unbiased"
-        assert np.allclose(bs.lags, lags)
-        assert np.allclose(bs.freq, freq)
-        assert np.allclose(bs.cum3, cum3)
-        assert np.allclose(bs.bispec, bispec)
-        assert np.allclose(bs.bispec_mag, bispec_mag)
-        assert allclose_with_wrap(bs.bispec_phase, bispec_phase)
-
-    def test_lc1_with_diff_lag(self):
-        bs = Bispectrum(self.lc1, maxlag=1)
-        lags = np.array([-0.5, 0, 0.5])
-        freq = np.array([-1, 0.0, 1])
-        cum3 = np.array(
-            [
-                [0.37114198, -0.62885802, -0.02160494],
-                [-0.62885802, 0.59259259, 0.37114198],
-                [-0.02160494, 0.37114198, -0.62885802],
-            ]
-        )
-
-        bispec = np.array(
-            [
-                [0.93595679 + 2.59807621e00j, 0.61419753 + 0j, 0.61419753 + 2.22044605e-16j],
-                [0.61419753 + 1.11022302e-16j, -0.22376543 + 0j, 0.61419753 - 1.11022302e-16j],
-                [0.61419753 - 2.22044605e-16j, 0.61419753 + 0j, 0.93595679 - 2.59807621e00j],
-            ]
-        )
-
-        bispec_mag = np.array(
-            [
-                [2.76152406, 0.61419753, 0.61419753],
-                [0.61419753, 0.22376543, 0.61419753],
-                [0.61419753, 0.61419753, 2.76152406],
-            ]
-        )
-
-        bispec_phase = np.array(
-            [
-                [1.22501950e00, 0, 3.61519859e-16],
-                [1.80759930e-16, 3.14159265e00, -1.80759930e-16],
-                [-3.61519859e-16, 0, -1.22501950e00],
-            ]
-        )
-
-        assert bs.lc == self.lc1
-        assert np.isclose(bs.fs, 2)
-        assert bs.maxlag == 1
-        assert bs.n == 6
-        assert bs.scale == "biased"
-        assert np.allclose(bs.lags, lags)
-        assert np.allclose(bs.freq, freq)
-        assert np.allclose(bs.cum3, cum3)
-        assert np.allclose(bs.bispec, bispec)
-        assert np.allclose(bs.bispec_mag, bispec_mag)
-        assert allclose_with_wrap(bs.bispec_phase, bispec_phase)
-
-    def test_lc1_unbiased_scale(self):
-        bs = Bispectrum(self.lc1, maxlag=1, scale="unbiased")
-        lags = np.array([-0.5, 0, 0.5])
-        freq = np.array([-1, 0.0, 1])
-
-        cum3 = np.array(
-            [
-                [0.44537037, -0.75462963, -0.03240741],
-                [-0.75462963, 0.59259259, 0.44537037],
-                [-0.03240741, 0.44537037, -0.75462963],
-            ]
-        )
-
-        bispec = np.array(
-            [
-                [0.99166667 + 3.11769145e00j, 0.62500000 + 0j, 0.62500000 + 0j],
-                [0.62500000 + 2.22044605e-16j, -0.40000000 + 0j, 0.62500000 - 2.22044605e-16j],
-                [0.62500000 + 0j, 0.62500000 + 0j, 0.99166667 - 3.11769145e00j],
-            ]
-        )
-
-        bispec_mag = np.array(
-            [[3.27160554, 0.625, 0.625], [0.625, 0.4, 0.625], [0.625, 0.625, 3.27160554]]
-        )
-
-        bispec_phase = np.array([[1.26283852, 0, 0], [0, 3.14159265, 0], [0, 0, -1.26283852]])
-
-        assert bs.lc == self.lc1
-        assert np.isclose(bs.fs, 2)
-        assert bs.maxlag == 1
-        assert bs.n == 6
-        assert bs.scale == "unbiased"
-        assert np.allclose(bs.lags, lags)
-        assert np.allclose(bs.freq, freq)
-        assert np.allclose(bs.cum3, cum3)
-        assert np.allclose(bs.bispec, bispec)
-        assert np.allclose(bs.bispec_mag, bispec_mag)
-        assert allclose_with_wrap(bs.bispec_phase, bispec_phase)
-
-    def test_bispectrum_window_none(self):
-        bs = Bispectrum(self.lc, scale="unbiased")
-        assert bs.window is None
-        assert bs.window_name == "No Window"
-
-    def test_bispectrum_window_uniform(self):
-        bs = Bispectrum(self.lc, maxlag=2, window="uniform")
-        lags = np.array([-2, -1, 0, 1, 2])
-        freq = np.array([-0.5, -0.25, 0.0, 0.25, 0.5])
-        bispec = np.array(
-            [
-                [
-                    1.23378944 - 1.03450204e00j,
-                    0.52344952 - 1.79651918e00j,
-                    0.12704520 - 9.59589442e-01j,
-                    -0.10264952 + 5.93058891e-01j,
-                    0.71979565 + 1.11022302e-16j,
-                ],
-                [
-                    0.52344952 - 1.79651918e00j,
-                    0.13901056 - 1.67385947e00j,
-                    0.20575480 - 1.11030991e00j,
-                    0.26900435 + 0.00000000e00j,
-                    -0.10264952 - 5.93058891e-01j,
-                ],
-                [
-                    0.12704520 - 9.59589442e-01j,
-                    0.20575480 - 1.11030991e00j,
-                    -0.53760000 + 0.00000000e00j,
-                    0.20575480 + 1.11030991e00j,
-                    0.12704520 + 9.59589442e-01j,
-                ],
-                [
-                    -0.10264952 + 5.93058891e-01j,
-                    0.26900435 + 0.00000000e00j,
-                    0.20575480 + 1.11030991e00j,
-                    0.13901056 + 1.67385947e00j,
-                    0.52344952 + 1.79651918e00j,
-                ],
-                [
-                    0.71979565 - 1.11022302e-16j,
-                    -0.10264952 - 5.93058891e-01j,
-                    0.12704520 + 9.59589442e-01j,
-                    0.52344952 + 1.79651918e00j,
-                    1.23378944 + 1.03450204e00j,
-                ],
-            ]
-        )
-
-        window = np.array(
-            [[0, 0, 0, 1, 1], [0, 0, 1, 1, 1], [0, 1, 1, 1, 0], [1, 1, 1, 0, 0], [1, 1, 0, 0, 0]]
-        )
-
-        assert bs.lc == self.lc
-        assert np.isclose(bs.fs, 1)
-        assert bs.maxlag == 2
-        assert bs.n == 5
-        assert np.allclose(bs.lags, lags)
-        assert np.allclose(bs.freq, freq)
-        assert np.allclose(bs.bispec, bispec)
-        assert bs.window_name == "uniform"
-        assert np.allclose(bs.window, window)
-
-    def test_bispectrum_window_parzen(self):
-        bs = Bispectrum(self.lc, maxlag=2, window="parzen")
-        bispec = np.array(
-            [
-                [
-                    0.32973576 - 7.99387943e-02j,
-                    0.30089706 - 1.04641240e-01j,
-                    0.27257082 - 3.99693972e-02j,
-                    0.28390294 + 2.47024460e-02j,
-                    0.31923282 + 6.93889390e-18j,
-                ],
-                [
-                    0.30089706 - 1.04641240e-01j,
-                    0.29306424 - 1.29343686e-01j,
-                    0.27122918 - 6.46718431e-02j,
-                    0.26556718 + 0.00000000e00j,
-                    0.28390294 - 2.47024460e-02j,
-                ],
-                [
-                    0.27257082 - 3.99693972e-02j,
-                    0.27122918 - 6.46718431e-02j,
-                    0.27040000 + 0.00000000e00j,
-                    0.27122918 + 6.46718431e-02j,
-                    0.27257082 + 3.99693972e-02j,
-                ],
-                [
-                    0.28390294 + 2.47024460e-02j,
-                    0.26556718 + 0.00000000e00j,
-                    0.27122918 + 6.46718431e-02j,
-                    0.29306424 + 1.29343686e-01j,
-                    0.30089706 + 1.04641240e-01j,
-                ],
-                [
-                    0.31923282 - 6.93889390e-18j,
-                    0.28390294 - 2.47024460e-02j,
-                    0.27257082 + 3.99693972e-02j,
-                    0.30089706 + 1.04641240e-01j,
-                    0.32973576 + 7.99387943e-02j,
-                ],
-            ]
-        )
-
-        window = np.array(
-            [
-                [
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                ],
-                [0.0, 0.0, 0.0625, 0.0625, 0.0],
-                [0.0, 0.0625, 1.0, 0.0625, 0.0],
-                [0.0, 0.0625, 0.0625, 0.0, 0.0],
-                [0.0, 0.0, 0.0, 0.0, 0.0],
-            ]
-        )
-
-        assert bs.lc == self.lc
-        assert np.isclose(bs.fs, 1)
-        assert bs.maxlag == 2
-        assert bs.n == 5
-        assert np.allclose(bs.bispec, bispec)
-        assert bs.window_name == "parzen"
-        assert np.allclose(bs.window, window)
-
-    def test_bispectrum_window_hamming(self):
-        bs = Bispectrum(self.lc, maxlag=2, window="hamming")
-        bispec = np.array(
-            [
-                [
-                    0.49072469 - 3.67258307e-01j,
-                    0.34762420 - 4.91066236e-01j,
-                    0.21848648 - 1.93948024e-01j,
-                    0.26176961 + 1.19866471e-01j,
-                    0.43090809 + 5.55111512e-17j,
-                ],
-                [
-                    0.34762420 - 4.91066236e-01j,
-                    0.30777863 - 5.94236424e-01j,
-                    0.21286804 - 3.03495625e-01j,
-                    0.19173603 + 5.55111512e-17j,
-                    0.26176961 - 1.19866471e-01j,
-                ],
-                [
-                    0.21848648 - 1.93948024e-01j,
-                    0.21286804 - 3.03495625e-01j,
-                    0.19471176 + 0.00000000e00j,
-                    0.21286804 + 3.03495625e-01j,
-                    0.21848648 + 1.93948024e-01j,
-                ],
-                [
-                    0.26176961 + 1.19866471e-01j,
-                    0.19173603 - 5.55111512e-17j,
-                    0.21286804 + 3.03495625e-01j,
-                    0.30777863 + 5.94236424e-01j,
-                    0.34762420 + 4.91066236e-01j,
-                ],
-                [
-                    0.43090809 - 5.55111512e-17j,
-                    0.26176961 - 1.19866471e-01j,
-                    0.21848648 + 1.93948024e-01j,
-                    0.34762420 + 4.91066236e-01j,
-                    0.49072469 + 3.67258307e-01j,
-                ],
-            ]
-        )
-
-        window = np.array(
-            [
-                [0, 0, 0, 0.023328, 0.0064],
-                [0.0, 0.0, 0.2916, 0.2916, 0.023328],
-                [0.0, 0.2916, 1.0, 0.2916, 0.0],
-                [0.023328, 0.2916, 0.2916, 0.0, 0.0],
-                [0.0064, 0.023328, 0.0, 0.0, 0.0],
-            ]
-        )
-
-        assert bs.lc == self.lc
-        assert np.isclose(bs.fs, 1)
-        assert bs.maxlag == 2
-        assert bs.n == 5
-        assert np.allclose(bs.bispec, bispec)
-        assert bs.window_name == "hamming"
-        assert np.allclose(bs.window, window)
-
-    def test_bispectrum_window_hanning(self):
-        bs = Bispectrum(self.lc, maxlag=2, window="hanning")
-        bispec = np.array(
-            [
-                [
-                    0.45494303 - 3.19755177e-01j,
-                    0.33958823 - 4.18564961e-01j,
-                    0.22628328 - 1.59877589e-01j,
-                    0.27161177 + 9.88097838e-02j,
-                    0.41293126 + 5.55111512e-17j,
-                ],
-                [
-                    0.33958823 - 4.18564961e-01j,
-                    0.30825697 - 5.17374745e-01j,
-                    0.22091672 - 2.58687372e-01j,
-                    0.19826874 + 5.55111512e-17j,
-                    0.27161177 - 9.88097838e-02j,
-                ],
-                [
-                    0.22628328 - 1.59877589e-01j,
-                    0.22091672 - 2.58687372e-01j,
-                    0.21760000 + 0.00000000e00j,
-                    0.22091672 + 2.58687372e-01j,
-                    0.22628328 + 1.59877589e-01j,
-                ],
-                [
-                    0.27161177 + 9.88097838e-02j,
-                    0.19826874 - 5.55111512e-17j,
-                    0.22091672 + 2.58687372e-01j,
-                    0.30825697 + 5.17374745e-01j,
-                    0.33958823 + 4.18564961e-01j,
-                ],
-                [
-                    0.41293126 - 5.55111512e-17j,
-                    0.27161177 - 9.88097838e-02j,
-                    0.22628328 + 1.59877589e-01j,
-                    0.33958823 + 4.18564961e-01j,
-                    0.45494303 + 3.19755177e-01j,
-                ],
-            ]
-        )
-
-        window = np.array(
-            [
-                [0.0, 0.0, 0.0, 0.0, 0.0],
-                [0.0, 0.0, 0.25, 0.25, 0.0],
-                [0.0, 0.25, 1.0, 0.25, 0.0],
-                [0.0, 0.25, 0.25, 0.0, 0.0],
-                [0.0, 0.0, 0.0, 0.0, 0.0],
-            ]
-        )
-
-        assert bs.lc == self.lc
-        assert np.isclose(bs.fs, 1)
-        assert bs.maxlag == 2
-        assert bs.n == 5
-        assert np.allclose(bs.bispec, bispec)
-        assert bs.window_name == "hanning"
-        assert np.allclose(bs.window, window)
-
-    def test_bispectrum_window_triangular(self):
-        bs = Bispectrum(self.lc, maxlag=2, window="triangular")
-        bispec = np.array(
-            [
-                [
-                    0.82428321 - 7.24678086e-01j,
-                    0.42949926 - 1.11847388e00j,
-                    0.16365995 - 5.32196997e-01j,
-                    0.12187354 + 3.28915833e-01j,
-                    0.57999943 + 5.55111512e-17j,
-                ],
-                [
-                    0.42949926 - 1.11847388e00j,
-                    0.25368159 - 1.17255377e00j,
-                    0.18598485 - 6.91254876e-01j,
-                    0.18948537 + 1.11022302e-16j,
-                    0.12187354 - 3.28915833e-01j,
-                ],
-                [
-                    0.16365995 - 5.32196997e-01j,
-                    0.18598485 - 6.91254876e-01j,
-                    -0.09896960 + 0.00000000e00j,
-                    0.18598485 + 6.91254876e-01j,
-                    0.16365995 + 5.32196997e-01j,
-                ],
-                [
-                    0.12187354 + 3.28915833e-01j,
-                    0.18948537 - 1.11022302e-16j,
-                    0.18598485 + 6.91254876e-01j,
-                    0.25368159 + 1.17255377e00j,
-                    0.42949926 + 1.11847388e00j,
-                ],
-                [
-                    0.57999943 - 5.55111512e-17j,
-                    0.12187354 - 3.28915833e-01j,
-                    0.16365995 + 5.32196997e-01j,
-                    0.42949926 + 1.11847388e00j,
-                    0.82428321 + 7.24678086e-01j,
-                ],
-            ]
-        )
-
-        window = np.array(
-            [
-                [0.0, 0.0, 0.0, 0.384, 0.36],
-                [0.0, 0.0, 0.64, 0.64, 0.384],
-                [0.0, 0.64, 1.0, 0.64, 0.0],
-                [0.384, 0.64, 0.64, 0.0, 0.0],
-                [0.36, 0.384, 0.0, 0.0, 0.0],
-            ]
-        )
-
-        assert bs.lc == self.lc
-        assert np.isclose(bs.fs, 1)
-        assert bs.maxlag == 2
-        assert bs.n == 5
-        assert np.allclose(bs.bispec, bispec)
-        assert bs.window_name == "triangular"
-        assert np.allclose(bs.window, window)
-
-    def test_bispectrum_window_welch(self):
-        bs = Bispectrum(self.lc, maxlag=2, window="welch")
-        bispec = np.array(
-            [
-                [
-                    0.66362182 - 7.19449149e-01j,
-                    0.40407352 - 9.41771162e-01j,
-                    0.14913738 - 3.59724574e-01j,
-                    0.25112648 + 2.22322014e-01j,
-                    0.56909534 + 5.55111512e-17j,
-                ],
-                [
-                    0.40407352 - 9.41771162e-01j,
-                    0.33357818 - 1.16409318e00j,
-                    0.13706262 - 5.82046588e-01j,
-                    0.08610466 + 0.00000000e00j,
-                    0.25112648 - 2.22322014e-01j,
-                ],
-                [
-                    0.14913738 - 3.59724574e-01j,
-                    0.13706262 - 5.82046588e-01j,
-                    0.12960000 + 0.00000000e00j,
-                    0.13706262 + 5.82046588e-01j,
-                    0.14913738 + 3.59724574e-01j,
-                ],
-                [
-                    0.25112648 + 2.22322014e-01j,
-                    0.08610466 + 0.00000000e00j,
-                    0.13706262 + 5.82046588e-01j,
-                    0.33357818 + 1.16409318e00j,
-                    0.40407352 + 9.41771162e-01j,
-                ],
-                [
-                    0.56909534 - 5.55111512e-17j,
-                    0.25112648 - 2.22322014e-01j,
-                    0.14913738 + 3.59724574e-01j,
-                    0.40407352 + 9.41771162e-01j,
-                    0.66362182 + 7.19449149e-01j,
-                ],
-            ]
-        )
-
-        window = np.array(
-            [
-                [0.0, 0.0, 0.0, 0.0, 0.0],
-                [0.0, 0.0, 0.5625, 0.5625, 0.0],
-                [0.0, 0.5625, 1.0, 0.5625, 0.0],
-                [0.0, 0.5625, 0.5625, 0.0, 0.0],
-                [0.0, 0.0, 0.0, 0.0, 0.0],
-            ]
-        )
-
-        assert bs.lc == self.lc
-        assert np.isclose(bs.fs, 1)
-        assert bs.maxlag == 2
-        assert bs.n == 5
-        assert np.allclose(bs.bispec, bispec)
-        assert bs.window_name == "welch"
-        assert np.allclose(bs.window, window)
-
-    def test_bispectrum_window_blackmann(self):
-        bs = Bispectrum(self.lc, maxlag=2, window="blackmann")
-        bispec = np.array(
-            [
-                [
-                    0.36998520 - 1.56242334e-01j,
-                    0.31320687 - 2.04896068e-01j,
-                    0.25789699 - 7.84933643e-02j,
-                    0.27972923 + 4.85115670e-02j,
-                    0.34901011 + 2.77555756e-17j,
-                ],
-                [
-                    0.31320687 - 2.04896068e-01j,
-                    0.29778797 - 2.52805407e-01j,
-                    0.25527601 - 1.26632734e-01j,
-                    0.24440392 + 2.77555756e-17j,
-                    0.27972923 - 4.85115670e-02j,
-                ],
-                [
-                    0.25789699 - 7.84933643e-02j,
-                    0.25527601 - 1.26632734e-01j,
-                    0.25316762 + 0.00000000e00j,
-                    0.25527601 + 1.26632734e-01j,
-                    0.25789699 + 7.84933643e-02j,
-                ],
-                [
-                    0.27972923 + 4.85115670e-02j,
-                    0.24440392 - 2.77555756e-17j,
-                    0.25527601 + 1.26632734e-01j,
-                    0.29778797 + 2.52805407e-01j,
-                    0.31320687 + 2.04896068e-01j,
-                ],
-                [
-                    0.34901011 - 2.77555756e-17j,
-                    0.27972923 - 4.85115670e-02j,
-                    0.25789699 + 7.84933643e-02j,
-                    0.31320687 + 2.04896068e-01j,
-                    0.36998520 + 1.56242334e-01j,
-                ],
-            ]
-        )
-
-        window = np.array(
-            [
-                [0.00000000e00, 0.00000000e00, 0.00000000e00, 8.41430799e-04, 4.73205937e-05],
-                [0.00000000e00, 0.00000000e00, 1.22318645e-01, 1.22318645e-01, 8.41430799e-04],
-                [0.00000000e00, 1.22318645e-01, 9.99997000e-01, 1.22318645e-01, 0.00000000e00],
-                [8.41430799e-04, 1.22318645e-01, 1.22318645e-01, 0.00000000e00, 0.00000000e00],
-                [4.73205937e-05, 8.41430799e-04, 0.00000000e00, 0.00000000e00, 0.00000000e00],
-            ]
-        )
-
-        assert bs.lc == self.lc
-        assert np.isclose(bs.fs, 1)
-        assert bs.maxlag == 2
-        assert bs.n == 5
-        assert np.allclose(bs.bispec, bispec)
-        assert bs.window_name == "blackmann"
-        assert np.allclose(bs.window, window)
-
-    def test_bispectrum_window_flattop(self):
-        bs = Bispectrum(self.lc, maxlag=2, window="flat-top")
-        bispec = np.array(
-            [
-                [
-                    28.90860041 - 0.40702734j,
-                    28.76176133 - 0.53280571j,
-                    28.61753157 - 0.20351367j,
-                    28.67523175 + 0.12577837j,
-                    28.85512219 + 0.0j,
-                ],
-                [
-                    28.76176133 - 0.53280571j,
-                    28.72187869 - 0.65858408j,
-                    28.61070029 - 0.32929204j,
-                    28.58187089 + 0.0j,
-                    28.67523175 - 0.12577837j,
-                ],
-                [
-                    28.61753157 - 0.20351367j,
-                    28.61070029 - 0.32929204j,
-                    28.60647832 + 0.0j,
-                    28.61070029 + 0.32929204j,
-                    28.61753157 + 0.20351367j,
-                ],
-                [
-                    28.67523175 + 0.12577837j,
-                    28.58187089 + 0.0j,
-                    28.61070029 + 0.32929204j,
-                    28.72187869 + 0.65858408j,
-                    28.76176133 + 0.53280571j,
-                ],
-                [
-                    28.85512219 + 0.0j,
-                    28.67523175 - 0.12577837j,
-                    28.61753157 + 0.20351367j,
-                    28.76176133 + 0.53280571j,
-                    28.90860041 + 0.40702734j,
-                ],
-            ]
-        )
-
-        window = np.array(
-            [
-                [0.00000000e00, -0.00000000e00, 0.00000000e00, 5.95391791e-18, 3.48773876e-32],
-                [-0.00000000e00, 0.00000000e00, 3.18233584e-01, 3.18233584e-01, 5.95391791e-18],
-                [0.00000000e00, 3.18233584e-01, 9.96392115e01, 3.18233584e-01, 0.00000000e00],
-                [5.95391791e-18, 3.18233584e-01, 3.18233584e-01, 0.00000000e00, -0.00000000e00],
-                [3.48773876e-32, 5.95391791e-18, 0.00000000e00, -0.00000000e00, 0.00000000e00],
-            ]
-        )
-
-        assert bs.lc == self.lc
-        assert np.isclose(bs.fs, 1)
-        assert bs.maxlag == 2
-        assert bs.n == 5
-        assert np.allclose(bs.bispec, bispec)
-        assert bs.window_name == "flat-top"
-        assert np.allclose(bs.window, window)
-
-    def test_bad_window(self):
-        window_bad = 123
+    def test_init_with_nonsense_data(self):
+        nonsense_data = [None for i in range(100)]
         with pytest.raises(TypeError):
-            bs = Bispectrum(self.lc, maxlag=2, window=window_bad)
+            Bispectrum(nonsense_data)
 
-    def test_not_available_window(self):
-        window_not = "kaiser"
+    def test_init_with_wrong_data_type(self):
+        with pytest.raises(TypeError):
+            Bispectrum(1)
+
+    def test_eventlist_needs_dt(self):
         with pytest.raises(ValueError):
-            bs = Bispectrum(self.lc, maxlag=2, window=window_not)
+            Bispectrum(self.events)
 
-    def test_plot_cum3(self):
-        bs = Bispectrum(self.lc)
-        bs.plot_cum3()
-        assert plt.fignum_exists(1)
+    def test_lc_keyword_deprecation(self):
+        with pytest.warns(DeprecationWarning) as record:
+            bs1 = Bispectrum(lc=self.lc)
+        assert np.any(["deprecated" in r.message.args[0].lower() for r in record])
+        bs2 = Bispectrum(data=self.lc)
+        good = np.isfinite(bs1.bispec)
+        assert np.allclose(bs1.bispec[good], bs2.bispec[good])
+
+    def test_bispec_mag_and_phase(self):
+        good = np.isfinite(self.bs.bispec)
+        assert np.allclose(self.bs.bispec_mag[good], np.abs(self.bs.bispec[good]))
+        assert np.allclose(self.bs.bispec_phase[good], self.bs.biphase[good])
+
+    def test_redundant_region_is_nan(self):
+        assert np.any(np.isnan(self.bs.bispec))
+        assert np.array_equal(np.isnan(self.bs.bispec), ~self.bs.valid)
+
+    def test_from_lightcurve_works(self):
+        bs = Bispectrum.from_lightcurve(self.lc)
+        good = np.isfinite(bs.bispec)
+        assert np.allclose(bs.bispec[good], self.bs.bispec[good])
+
+    def test_from_events_works(self):
+        bs = Bispectrum.from_events(self.events, dt=self.dt)
+        assert isinstance(bs, Bispectrum)
+
+    def test_from_time_array_works(self):
+        bs = Bispectrum.from_time_array(self.events.time, dt=self.dt, gti=[[0, self.n * self.dt]])
+        assert isinstance(bs, Bispectrum)
+
+    def test_from_stingray_timeseries_works(self):
+        ts = StingrayTimeseries(
+            self.time, array_attrs={"flux": self.counts}, dt=self.dt, skip_checks=True
+        )
+        ts.gti = self.lc.gti
+        bs = Bispectrum.from_stingray_timeseries(ts, "flux")
+        good = np.isfinite(bs.bispec)
+        assert np.allclose(bs.bispec[good], self.bs.bispec[good])
+
+
+class TestAveragedBispectrum(object):
+    @classmethod
+    def setup_class(cls):
+        cls.dt = 0.1
+        cls.n = 512
+        cls.segment_size = 5.0
+        cls.time = np.arange(cls.n) * cls.dt
+        cls.counts = rng.poisson(40, cls.n).astype(float)
+        cls.lc = Lightcurve(cls.time, cls.counts, dt=cls.dt, skip_checks=True)
+        cls.events = EventList(
+            np.sort(rng.uniform(0, cls.n * cls.dt, 8000)), gti=[[0, cls.n * cls.dt]]
+        )
+        cls.bs = AveragedBispectrum(cls.lc, segment_size=cls.segment_size)
+
+    @pytest.mark.parametrize("skip_checks", [True, False])
+    def test_initialize_empty(self, skip_checks):
+        bs = AveragedBispectrum(skip_checks=skip_checks)
+        assert bs.freq is None
+        assert bs.m == 1
+
+    def test_averaged_bispectrum_from_lightcurve(self):
+        assert isinstance(self.bs, AveragedBispectrum)
+        assert self.bs.m > 1
+
+    @pytest.mark.parametrize("nseg", [1, 2, 5, 10])
+    def test_n_segments(self, nseg):
+        segment_size = self.n * self.dt / nseg
+        bs = AveragedBispectrum(self.lc, segment_size=segment_size)
+        assert bs.m == nseg
+
+    def test_segments_with_leftover(self):
+        # A segment size that does not divide the light curve evenly
+        bs = AveragedBispectrum(self.lc, segment_size=self.segment_size * 1.5)
+        assert bs.m > 1
+
+    def test_init_without_segment(self):
+        with pytest.raises(ValueError):
+            AveragedBispectrum(self.lc)
+
+    def test_init_with_none_segment(self):
+        with pytest.raises(ValueError):
+            AveragedBispectrum(self.lc, segment_size=None)
+
+    def test_lc_keyword_deprecation(self):
+        with pytest.warns(DeprecationWarning):
+            AveragedBispectrum(lc=self.lc, segment_size=self.segment_size)
+
+    def test_from_lightcurve_works(self):
+        bs = AveragedBispectrum.from_lightcurve(self.lc, segment_size=self.segment_size)
+        good = np.isfinite(bs.bispec)
+        assert np.allclose(bs.bispec[good], self.bs.bispec[good])
+
+    def test_from_events_works(self):
+        bs = AveragedBispectrum.from_events(self.events, dt=self.dt, segment_size=self.segment_size)
+        assert isinstance(bs, AveragedBispectrum)
+        assert bs.m > 1
+
+    def test_from_time_array_works(self):
+        bs = AveragedBispectrum.from_time_array(
+            self.events.time,
+            dt=self.dt,
+            segment_size=self.segment_size,
+            gti=[[0, self.n * self.dt]],
+        )
+        assert bs.m > 1
+
+    def test_list_of_light_curves(self):
+        bs = AveragedBispectrum([self.lc, self.lc], segment_size=self.segment_size)
+        assert isinstance(bs, AveragedBispectrum)
+
+    def test_from_lc_iterable_works(self):
+        bs = AveragedBispectrum.from_lc_iterable(
+            [self.lc, self.lc], self.dt, segment_size=self.segment_size
+        )
+        assert isinstance(bs, AveragedBispectrum)
+
+    def test_list_with_nonsense_component(self):
+        with pytest.raises(TypeError):
+            AveragedBispectrum([self.lc, 3], segment_size=self.segment_size)
+
+    def test_save_all(self):
+        bs = AveragedBispectrum.from_lightcurve(
+            self.lc, segment_size=self.segment_size, save_all=True
+        )
+        assert hasattr(bs, "bispec_all")
+        assert len(bs.bispec_all) == bs.m
+
+    def test_gti_is_threaded_through(self):
+        full = AveragedBispectrum(self.lc, segment_size=self.segment_size)
+        half = AveragedBispectrum(
+            self.lc, segment_size=self.segment_size, gti=[[0, self.n * self.dt / 2]]
+        )
+        assert half.m < full.m
+
+    def test_skip_checks(self):
+        AveragedBispectrum(self.lc, segment_size=self.segment_size, skip_checks=True)
+
+
+class TestBispectrumEstimator(object):
+    """Tests of the underlying Fourier estimator functions in ``fourier.py``
+    (``avg_bispectrum_from_iterable``, ``avg_bispectrum_from_timeseries``,
+    ``bicoherence_from_sums``, ``_bispectrum_frequency_grid``).
+    """
+
+    @classmethod
+    def setup_class(cls):
+        cls.dt = 0.1
+        cls.n_bin = 32
+        cls.segments = [rng.poisson(25, cls.n_bin).astype(float) for _ in range(40)]
+
+        # For the counts-vs-events equality test
+        cls.length = 100.0
+        cls.ctrate = 1000
+        cls.segment_size = 5.0
+        cls.N = int(cls.length / cls.dt)
+        cls.times = np.sort(rng.uniform(0, cls.length, int(cls.length * cls.ctrate)))
+        cls.gti = np.asanyarray([[0, cls.length]])
+        cls.counts, bins = np.histogram(cls.times, bins=np.linspace(0, cls.length, cls.N + 1))
+        cls.bin_times = (bins[:-1] + bins[1:]) / 2
+
+    def test_frequency_grid(self):
+        freq, idx1, idx2, idx3, valid = _bispectrum_frequency_grid(self.n_bin, self.dt)
+        fgt0 = positive_fft_bins(self.n_bin)
+        assert np.allclose(freq, fftfreq(self.n_bin, self.dt)[fgt0])
+        assert idx1.shape == (freq.size, freq.size)
+        # The valid region is where f1 + f2 is at or below the Nyquist bin
+        assert np.all(idx3[valid] <= self.n_bin // 2)
+
+    def test_no_segments_returns_none(self):
+        assert avg_bispectrum_from_iterable(iter([]), self.dt, silent=True) is None
+
+    def test_matches_brute_force(self):
+        res = avg_bispectrum_from_iterable(iter(self.segments), self.dt, silent=True)
+        bispec_ref, norms_ref, valid = _brute_force_bispectrum(self.segments, self.n_bin)
+        assert np.array_equal(res.meta["valid"], valid)
+        assert np.allclose(res.meta["bispec"][valid], bispec_ref[valid], atol=1e-9)
+        assert np.allclose(
+            res.meta["bicoherence"][valid], norms_ref["kim_powers"][valid], atol=1e-12
+        )
+
+    @pytest.mark.parametrize("norm", BICOHERENCE_NORMS)
+    def test_all_norms_match_brute_force(self, norm):
+        _, norms_ref, valid = _brute_force_bispectrum(self.segments, self.n_bin)
+        res = avg_bispectrum_from_iterable(
+            iter(self.segments), self.dt, bicoherence_norm=norm, silent=True
+        )
+        assert np.allclose(res.meta["bicoherence"][valid], norms_ref[norm][valid], atol=1e-12)
+
+    def test_kim_powers_is_sigl_chamoun_squared(self):
+        rk = avg_bispectrum_from_iterable(
+            iter(self.segments), self.dt, bicoherence_norm="kim_powers", silent=True
+        )
+        rs = avg_bispectrum_from_iterable(
+            iter(self.segments), self.dt, bicoherence_norm="sigl_chamoun", silent=True
+        )
+        valid = rk.meta["valid"]
+        assert np.allclose(
+            rk.meta["bicoherence"][valid], rs.meta["bicoherence"][valid] ** 2, atol=1e-12
+        )
+
+    def test_biphase_is_angle_of_bispectrum(self):
+        res = avg_bispectrum_from_iterable(iter(self.segments), self.dt, silent=True)
+        valid = res.meta["valid"]
+        d = np.angle(
+            np.exp(1j * (res.meta["biphase"][valid] - np.angle(res.meta["bispec"][valid])))
+        )
+        assert np.allclose(d, 0, atol=1e-9)
+
+    def test_single_segment_bicoherence_is_one(self):
+        res = avg_bispectrum_from_iterable(iter(self.segments[:1]), self.dt, silent=True)
+        valid = res.meta["valid"]
+        assert np.allclose(res.meta["bicoherence"][valid], 1.0)
+        assert np.allclose(res.meta["biphase_err"][valid], 0.0)
+        assert res.meta["m"] == 1
+
+    def test_bad_norm_raises(self):
+        with pytest.raises(ValueError):
+            avg_bispectrum_from_iterable(
+                iter(self.segments), self.dt, bicoherence_norm="bogus", silent=True
+            )
+
+    def test_bicoherence_from_sums_bad_norm(self):
+        ones = np.ones((2, 2))
+        with pytest.raises(ValueError):
+            bicoherence_from_sums("bogus", ones, ones, ones, ones)
+
+    def test_cts_and_events_are_equal(self):
+        bs_evts = avg_bispectrum_from_timeseries(
+            self.times, self.gti, self.segment_size, self.dt, silent=True
+        )
+        bs_cts = avg_bispectrum_from_timeseries(
+            self.bin_times, self.gti, self.segment_size, self.dt, fluxes=self.counts, silent=True
+        )
+        valid = bs_evts.meta["valid"]
+        assert np.allclose(bs_evts.meta["bispec"][valid], bs_cts.meta["bispec"][valid])
+        assert np.allclose(bs_evts.meta["bicoherence"][valid], bs_cts.meta["bicoherence"][valid])
+
+    @pytest.mark.parametrize("norm", BICOHERENCE_NORMS)
+    def test_detects_quadratic_coupling(self, norm):
+        rng_local = np.random.RandomState(99)
+        dt, n_bin = 0.01, 128
+        f1, f2 = 5.0, 12.0
+        coupled = _coupled_segments(rng_local, 300, n_bin, dt, f1, f2, couple=True)
+        control = _coupled_segments(rng_local, 300, n_bin, dt, f1, f2, couple=False)
+        res_c = avg_bispectrum_from_iterable(iter(coupled), dt, bicoherence_norm=norm, silent=True)
+        res_u = avg_bispectrum_from_iterable(iter(control), dt, bicoherence_norm=norm, silent=True)
+        freq = res_c.meta["freq"]
+        i1 = np.argmin(np.abs(freq - f1))
+        i2 = np.argmin(np.abs(freq - f2))
+        # Strong coupling gives a high bicoherence; the control (same power
+        # spectrum, random relative phase) gives a low one, for every norm.
+        assert res_c.meta["bicoherence"][i1, i2] > 0.7
+        assert res_u.meta["bicoherence"][i1, i2] < 0.4
+        assert res_c.meta["bicoherence"][i1, i2] > res_u.meta["bicoherence"][i1, i2]
+
+    def test_biphase_of_coupling(self):
+        rng_local = np.random.RandomState(5)
+        dt, n_bin = 0.01, 128
+        f1, f2 = 5.0, 12.0
+        segs = _coupled_segments(rng_local, 200, n_bin, dt, f1, f2, couple=True)
+        res = avg_bispectrum_from_iterable(iter(segs), dt, silent=True)
+        freq = res.meta["freq"]
+        i1 = np.argmin(np.abs(freq - f1))
+        i2 = np.argmin(np.abs(freq - f2))
+        assert abs(res.meta["biphase"][i1, i2]) < 0.2
+
+
+class TestBispectrumNormalization(object):
+    @classmethod
+    def setup_class(cls):
+        cls.dt = 0.01
+        n = 256 * 20
+        cls.lc = Lightcurve(
+            np.arange(n) * cls.dt, rng.poisson(60, n).astype(float), dt=cls.dt, skip_checks=True
+        )
+        cls.segment_size = 2.56
+
+    def test_default_is_kim_powers(self):
+        bs = AveragedBispectrum(self.lc, segment_size=self.segment_size)
+        assert bs.bicoherence_norm == "kim_powers"
+
+    @pytest.mark.parametrize("norm", ["kim_powers", "sigl_chamoun", "hagihira"])
+    def test_norm_parameter(self, norm):
+        bs = AveragedBispectrum(self.lc, segment_size=self.segment_size, bicoherence_norm=norm)
+        assert bs.bicoherence_norm == norm
+        valid = bs.valid
+        assert np.all(bs.bicoherence[valid] >= 0)
+        assert np.all(bs.bicoherence[valid] <= 1)
+
+    @pytest.mark.parametrize("norm", ["kim_powers", "sigl_chamoun", "hagihira"])
+    def test_recompute_matches_direct(self, norm):
+        bs = AveragedBispectrum(self.lc, segment_size=self.segment_size)
+        direct = AveragedBispectrum(self.lc, segment_size=self.segment_size, bicoherence_norm=norm)
+        recomputed = bs.recompute_bicoherence(norm)
+        valid = bs.valid
+        assert np.allclose(recomputed[valid], direct.bicoherence[valid], atol=1e-12)
+
+    def test_recompute_inplace(self):
+        bs = AveragedBispectrum(self.lc, segment_size=self.segment_size)
+        bs.recompute_bicoherence("hagihira", inplace=True)
+        assert bs.bicoherence_norm == "hagihira"
+
+    def test_recompute_bad_norm(self):
+        bs = AveragedBispectrum(self.lc, segment_size=self.segment_size)
+        with pytest.raises(ValueError):
+            bs.recompute_bicoherence("nope")
+
+    def test_recompute_on_empty_raises(self):
+        with pytest.raises(ValueError):
+            Bispectrum().recompute_bicoherence("kim_powers")
+
+
+class TestBispectrumIO(object):
+    @classmethod
+    def setup_class(cls):
+        cls.dt = 0.1
+        cls.n = 256
+        lc = Lightcurve(
+            np.arange(cls.n) * cls.dt,
+            rng.poisson(40, cls.n).astype(float),
+            dt=cls.dt,
+            skip_checks=True,
+        )
+        cls.bs = AveragedBispectrum(lc, segment_size=5.0)
+
+    def test_astropy_table_roundtrip(self):
+        ts = self.bs.to_astropy_table()
+        back = AveragedBispectrum.from_astropy_table(ts)
+        assert np.allclose(back.freq, self.bs.freq)
+        assert np.allclose(np.nan_to_num(back.bispec), np.nan_to_num(self.bs.bispec))
+        assert np.allclose(np.nan_to_num(back.bicoherence), np.nan_to_num(self.bs.bicoherence))
+
+    def test_recompute_survives_roundtrip(self):
+        ts = self.bs.to_astropy_table()
+        back = AveragedBispectrum.from_astropy_table(ts)
+        valid = self.bs.valid
+        assert np.allclose(
+            back.recompute_bicoherence("sigl_chamoun")[valid],
+            self.bs.recompute_bicoherence("sigl_chamoun")[valid],
+            atol=1e-12,
+        )
+
+    @pytest.mark.parametrize("fmt", ["pickle"])
+    def test_file_roundtrip(self, fmt):
+        fname = f"test_bispec.{fmt}"
+        try:
+            self.bs.write(fname, fmt=fmt)
+            back = AveragedBispectrum.read(fname, fmt=fmt)
+            assert np.allclose(back.freq, self.bs.freq)
+            assert np.allclose(np.nan_to_num(back.bispec), np.nan_to_num(self.bs.bispec))
+        finally:
+            if os.path.exists(fname):
+                os.remove(fname)
+
+
+class TestBispectrumPlots(object):
+    @classmethod
+    def setup_class(cls):
+        lc = Lightcurve(
+            np.arange(256) * 0.1, rng.poisson(40, 256).astype(float), dt=0.1, skip_checks=True
+        )
+        cls.bs = AveragedBispectrum(lc, segment_size=5.0)
+
+    def teardown_method(self):
+        clear_all_figs()
 
     def test_plot_mag(self):
-        bs = Bispectrum(self.lc)
-        bs.plot_mag()
-        assert plt.fignum_exists(1)
+        ax = self.bs.plot_mag()
+        assert ax is not None
 
     def test_plot_phase(self):
-        bs = Bispectrum(self.lc)
-        bs.plot_phase()
-        assert plt.fignum_exists(1)
+        ax = self.bs.plot_phase()
+        assert ax is not None
 
-    def test_plot_cum3_axis(self):
-        bs = Bispectrum(self.lc)
-        bs.plot_cum3(axis=[0, 1, 0, 100])
-        assert plt.fignum_exists(1)
+    def test_plot_bicoherence(self):
+        ax = self.bs.plot_bicoherence()
+        assert ax is not None
 
-    def test_plot_mag_axis(self):
-        bs = Bispectrum(self.lc)
-        bs.plot_mag(axis=[0, 1, 0, 100])
-        assert plt.fignum_exists(1)
+    def test_plot_on_given_axis(self):
+        _, ax = plt.subplots()
+        out = self.bs.plot_mag(ax=ax)
+        assert out is ax
 
-    def test_plot_phase_axis(self):
-        bs = Bispectrum(self.lc)
-        bs.plot_phase(axis=[0, 1, 0, 100])
-        assert plt.fignum_exists(1)
+    def test_plot_save(self, tmp_path):
+        fname = str(tmp_path / "mag.png")
+        self.bs.plot_mag(save=True, filename=fname)
+        assert os.path.exists(fname)
+
+    def test_plot_empty_raises(self):
+        with pytest.raises(ValueError):
+            Bispectrum().plot_mag()
