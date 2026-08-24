@@ -1618,8 +1618,10 @@ class DynamicalCrossBispectrum(AveragedCrossBispectrum):
                 vmax=vmax,
             )
             ax.set_title(f"t = {self.time[k]:g} s", fontsize=9)
-        fig.supxlabel("$f_1$ (Hz)")
-        fig.supylabel("$f_2$ (Hz)")
+        # figure-level axis labels (fig.supxlabel/supylabel need matplotlib >= 3.4,
+        # below the project's floor, so use fig.text instead).
+        fig.text(0.5, 0.04, "$f_1$ (Hz)", ha="center")
+        fig.text(0.04, 0.5, "$f_2$ (Hz)", va="center", rotation="vertical")
         if pc is not None:
             fig.colorbar(pc, ax=axes, fraction=0.02, pad=0.01, label="bicoherence")
         return axes
@@ -1658,10 +1660,10 @@ class DynamicalCrossBispectrum(AveragedCrossBispectrum):
             f"Coupling at $(f_1, f_2) = ({self.freq[self._freq_index(f1)]:g}, "
             f"{self.freq[self._freq_index(f2)]:g})$ Hz"
         )
-        ax1.plot(time, bip, "o-", color="tab:orange")
-        ax1.set_ylabel("biphase (rad)")
+        ax1.plot(time, np.degrees(bip), "o-", color="tab:orange")
+        ax1.set_ylabel("biphase (deg)")
         ax1.set_xlabel("Time (s)")
-        ax1.set_ylim(-np.pi, np.pi)
+        ax1.set_ylim(-190, 190)
         return axes
 
     def _rebinned_by_n_time(self, n):
