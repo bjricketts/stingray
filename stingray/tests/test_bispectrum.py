@@ -6,12 +6,18 @@ import pytest
 import matplotlib.pyplot as plt
 
 from stingray import Lightcurve, EventList, StingrayTimeseries
-from stingray.bispectrum import Bispectrum, AveragedBispectrum
+from stingray.bispectrum import (
+    Bispectrum,
+    AveragedBispectrum,
+    CrossBispectrum,
+    AveragedCrossBispectrum,
+)
 from stingray.fourier import (
     fftfreq,
     positive_fft_bins,
     avg_bispectrum_from_iterable,
     avg_bispectrum_from_timeseries,
+    avg_cross_bispectrum_from_iterables,
     bicoherence_from_sums,
     BICOHERENCE_NORMS,
     _bispectrum_frequency_grid,
@@ -695,3 +701,210 @@ class TestBispectrumPoisson(object):
 
     def test_empty_flag_default(self):
         assert Bispectrum().poisson_subtracted is False
+
+
+def _cross_bands(rng_local, n_seg, n_bin, dt, f1, f2, couple=True):
+    """Two simultaneous bands: band A carries f1, f2; band B carries f1+f2,
+    phase-locked to A (couple=True) or with an independent phase."""
+    t = np.arange(n_bin) * dt
+    ca, cb = [], []
+    for _ in range(n_seg):
+        p1, p2 = rng_local.uniform(0, 2 * np.pi, size=2)
+        a = 0.5 * np.cos(2 * np.pi * f1 * t + p1) + 0.5 * np.cos(2 * np.pi * f2 * t + p2)
+        pb = (p1 + p2) if couple else rng_local.uniform(0, 2 * np.pi)
+        b = 0.5 * np.cos(2 * np.pi * (f1 + f2) * t + pb)
+        ca.append(rng_local.poisson(np.clip(500 * (1 + a), 0, None) * dt))
+        cb.append(rng_local.poisson(np.clip(500 * (1 + b), 0, None) * dt))
+    a = np.concatenate(ca).astype(float)
+    b = np.concatenate(cb).astype(float)
+    lca = Lightcurve(np.arange(a.size) * dt, a, dt=dt, skip_checks=True)
+    lcb = Lightcurve(np.arange(b.size) * dt, b, dt=dt, skip_checks=True)
+    return lca, lcb
+
+
+class TestCrossBispectrum(object):
+    @classmethod
+    def setup_class(cls):
+        cls.dt = 0.05
+        cls.n = 512
+        cls.segment_size = 5.0
+        cls.time = np.arange(cls.n) * cls.dt
+        rng2 = np.random.RandomState(42)
+        cls.lc1 = Lightcurve(
+            cls.time, rng2.poisson(50, cls.n).astype(float), dt=cls.dt, skip_checks=True
+        )
+        cls.lc2 = Lightcurve(
+            cls.time, rng2.poisson(50, cls.n).astype(float), dt=cls.dt, skip_checks=True
+        )
+        cls.lc3 = Lightcurve(
+            cls.time, rng2.poisson(50, cls.n).astype(float), dt=cls.dt, skip_checks=True
+        )
+        cls.xbs = CrossBispectrum(cls.lc1, cls.lc2, cls.lc3)
+
+    def test_type_and_hierarchy(self):
+        assert self.xbs.type == "crossbispectrum"
+        assert isinstance(Bispectrum(), CrossBispectrum)
+        assert isinstance(AveragedBispectrum(), AveragedCrossBispectrum)
+
+    def test_signed_grid(self):
+        # cross-bispectrum uses the full signed frequency plane
+        assert np.any(self.xbs.freq < 0)
+        assert np.any(self.xbs.freq > 0)
+        nf = self.xbs.freq.size
+        assert self.xbs.bispec.shape == (nf, nf)
+
+    def test_empty(self):
+        xbs = CrossBispectrum()
+        assert xbs.freq is None
+        assert xbs.type == "crossbispectrum"
+
+    def test_nphots_per_channel(self):
+        assert self.xbs.nphots1 is not None
+        assert self.xbs.nphots3 is not None
+
+    def test_single_arg_defaults_to_auto(self):
+        # CrossBispectrum(lc) should set data2 = data3 = data1
+        xbs = CrossBispectrum(self.lc1)
+        assert xbs.bispec is not None
+
+    def test_mismatched_kinds_raise(self):
+        ev = EventList(np.sort(np.random.uniform(0, 10, 50)), gti=[[0, 10]])
+        with pytest.raises((ValueError, TypeError)):
+            CrossBispectrum(self.lc1, ev, self.lc3, dt=self.dt)
+
+    def test_mismatched_time_bins_raise(self):
+        other = Lightcurve(
+            np.arange(self.n) * self.dt * 2, self.lc1.counts, dt=self.dt * 2, skip_checks=True
+        )
+        with pytest.raises(ValueError):
+            CrossBispectrum(self.lc1, self.lc2, other)
+
+    def test_reduces_to_auto_when_identical(self):
+        auto = Bispectrum(self.lc1)
+        cross = CrossBispectrum(self.lc1, self.lc1, self.lc1)
+        i1a, i2a = 3, 5
+        f1, f2 = auto.freq[i1a], auto.freq[i2a]
+        c1 = int(np.argmin(np.abs(cross.freq - f1)))
+        c2 = int(np.argmin(np.abs(cross.freq - f2)))
+        assert np.isclose(auto.bispec[i1a, i2a], cross.bispec[c1, c2])
+
+    def test_from_lightcurve(self):
+        xbs = CrossBispectrum.from_lightcurve(self.lc1, self.lc2, self.lc3)
+        assert isinstance(xbs, CrossBispectrum)
+
+    def test_from_events(self):
+        rng2 = np.random.RandomState(1)
+        evs = [EventList(np.sort(rng2.uniform(0, 100, 3000)), gti=[[0, 100]]) for _ in range(3)]
+        xbs = CrossBispectrum.from_events(*evs, dt=0.1)
+        assert isinstance(xbs, CrossBispectrum)
+
+    def test_averaged(self):
+        xbs = AveragedCrossBispectrum(self.lc1, self.lc2, self.lc3, segment_size=self.segment_size)
+        assert isinstance(xbs, AveragedCrossBispectrum)
+        assert xbs.m > 1
+
+    def test_averaged_needs_segment(self):
+        with pytest.raises(ValueError):
+            AveragedCrossBispectrum(self.lc1, self.lc2, self.lc3)
+
+    @pytest.mark.parametrize("norm", BICOHERENCE_NORMS)
+    def test_recompute_bicoherence(self, norm):
+        b = self.xbs.recompute_bicoherence(norm)
+        valid = self.xbs.valid
+        assert np.all(b[valid] >= 0)
+        assert np.all(b[valid] <= 1)
+
+    def test_detects_cross_coupling(self):
+        rng_local = np.random.RandomState(7)
+        dt, n_bin, n_seg = 0.01, 128, 400
+        f1, f2 = 5.0, 12.0
+        lca_c, lcb_c = _cross_bands(rng_local, n_seg, n_bin, dt, f1, f2, couple=True)
+        lca_u, lcb_u = _cross_bands(rng_local, n_seg, n_bin, dt, f1, f2, couple=False)
+        xc = AveragedCrossBispectrum(
+            lca_c, lca_c, lcb_c, segment_size=n_bin * dt, bicoherence_norm="sigl_chamoun"
+        )
+        xu = AveragedCrossBispectrum(
+            lca_u, lca_u, lcb_u, segment_size=n_bin * dt, bicoherence_norm="sigl_chamoun"
+        )
+        i1 = int(np.argmin(np.abs(xc.freq - f1)))
+        i2 = int(np.argmin(np.abs(xc.freq - f2)))
+        assert xc.bicoherence[i1, i2] > 0.7
+        assert xu.bicoherence[i1, i2] < 0.3
+
+    def test_index_convention_broken_swap_symmetry(self):
+        # Three DISTINCT bands: X only at f1, Y only at f2, Z only at f1+f2.
+        # Coupling appears at (f1, f2) but not at the swapped (f2, f1); this also
+        # documents that bispec[i, j] is indexed (f1=freq[i], f2=freq[j]).
+        rng_local = np.random.RandomState(3)
+        dt, n_bin, n_seg = 0.01, 128, 400
+        f1, f2 = 5.0, 12.0
+        t = np.arange(n_bin) * dt
+        cx, cy, cz = [], [], []
+        for _ in range(n_seg):
+            p1, p2 = rng_local.uniform(0, 2 * np.pi, size=2)
+            cx.append(
+                rng_local.poisson(
+                    np.clip(500 * (1 + 0.5 * np.cos(2 * np.pi * f1 * t + p1)), 0, None) * dt
+                )
+            )
+            cy.append(
+                rng_local.poisson(
+                    np.clip(500 * (1 + 0.5 * np.cos(2 * np.pi * f2 * t + p2)), 0, None) * dt
+                )
+            )
+            cz.append(
+                rng_local.poisson(
+                    np.clip(500 * (1 + 0.5 * np.cos(2 * np.pi * (f1 + f2) * t + p1 + p2)), 0, None)
+                    * dt
+                )
+            )
+
+        def lc(ch):
+            c = np.concatenate(ch).astype(float)
+            return Lightcurve(np.arange(c.size) * dt, c, dt=dt, skip_checks=True)
+
+        xbs = AveragedCrossBispectrum(
+            lc(cx), lc(cy), lc(cz), segment_size=n_bin * dt, bicoherence_norm="sigl_chamoun"
+        )
+        i1 = int(np.argmin(np.abs(xbs.freq - f1)))
+        i2 = int(np.argmin(np.abs(xbs.freq - f2)))
+        assert xbs.bicoherence[i1, i2] > 0.7  # (f1, f2): coupled
+        assert xbs.bicoherence[i2, i1] < 0.3  # (f2, f1): swap is absent
+        # reality symmetry: B(-f1, -f2) = conj(B(f1, f2)) -> same bicoherence
+        mi1 = int(np.argmin(np.abs(xbs.freq + f1)))
+        mi2 = int(np.argmin(np.abs(xbs.freq + f2)))
+        assert np.isclose(xbs.bicoherence[i1, i2], xbs.bicoherence[mi1, mi2], atol=1e-6)
+
+    def test_astropy_table_roundtrip(self):
+        xbs = AveragedCrossBispectrum(self.lc1, self.lc2, self.lc3, segment_size=self.segment_size)
+        ts = xbs.to_astropy_table()
+        back = AveragedCrossBispectrum.from_astropy_table(ts)
+        assert np.allclose(back.freq, xbs.freq)
+        assert np.allclose(np.nan_to_num(back.bispec), np.nan_to_num(xbs.bispec))
+
+    def test_cross_jellyfish(self):
+        xbs = AveragedCrossBispectrum(
+            self.lc1, self.lc2, self.lc3, segment_size=self.segment_size, save_diagonal=True
+        )
+        ax = xbs.plot_jellyfish()
+        assert ax is not None
+        plt.close("all")
+
+    def test_poisson_only_with_overlap(self):
+        # poisson_subtract has no effect for independent channels
+        base = AveragedCrossBispectrum(self.lc1, self.lc2, self.lc3, segment_size=self.segment_size)
+        indep = AveragedCrossBispectrum(
+            self.lc1, self.lc2, self.lc3, segment_size=self.segment_size, poisson_subtract=True
+        )
+        assert indep.poisson_subtracted is False
+        valid = base.valid
+        assert np.allclose(np.nan_to_num(base.bispec[valid]), np.nan_to_num(indep.bispec[valid]))
+        overlap = AveragedCrossBispectrum(
+            self.lc1,
+            self.lc1,
+            self.lc1,
+            segment_size=self.segment_size,
+            poisson_subtract=True,
+            channels_overlap=True,
+        )
+        assert overlap.poisson_subtracted is True

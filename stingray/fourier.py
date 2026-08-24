@@ -40,6 +40,8 @@ __all__ = [
     "intrinsic_coherence",
     "avg_bispectrum_from_iterable",
     "avg_bispectrum_from_timeseries",
+    "avg_cross_bispectrum_from_iterables",
+    "avg_cross_bispectrum_from_timeseries",
     "bicoherence_from_sums",
     "BICOHERENCE_NORMS",
 ]
@@ -2998,16 +3000,15 @@ def avg_pds_from_timeseries(
     return cross
 
 
-def _bispectrum_frequency_grid(n_bin, dt):
+def _bispectrum_frequency_grid(n_bin, dt, fullspec=False):
     """Frequency axis and (f1, f2) bin-index grid for a bispectrum.
 
-    The bispectrum ``B(f1, f2)`` is sampled on the positive-frequency axis of an
+    The bispectrum ``B(f1, f2)`` is sampled on the Fourier frequencies of an
     ``n_bin``-point FFT. Because the third frequency is ``f3 = f1 + f2``, the
-    quantity is only defined where ``f1 + f2`` is still a resolved (``<=``
-    Nyquist) frequency. This helper returns the positive frequency array, the
-    integer FFT bin indices of ``f1`` and ``f2`` on a 2D grid, the bin indices
-    of ``f1 + f2``, and a boolean mask of the valid (non-redundant, resolved)
-    region of the plane.
+    quantity is only defined where ``f1 + f2`` is still a resolved (``|f| <=``
+    Nyquist) frequency. This helper returns the frequency array, the integer
+    FFT bin indices of ``f1`` and ``f2`` on a 2D grid, the bin indices of
+    ``f1 + f2``, and a boolean mask of the valid (resolved) region.
 
     Parameters
     ----------
@@ -3016,33 +3017,61 @@ def _bispectrum_frequency_grid(n_bin, dt):
     dt : float
         Time resolution of the light curve.
 
+    Other Parameters
+    ----------------
+    fullspec : bool, default False
+        If ``False`` (the auto-bispectrum case), sample only positive
+        frequencies. The auto-bispectrum is symmetric under ``f1 <-> f2``, so
+        the Nyquist triangle ``f1, f2 >= 0, f1 + f2 <= f_Nyq`` is enough.
+        If ``True`` (the cross-bispectrum case), sample **signed** frequencies:
+        ``f1`` and ``f2`` each range over positive and negative frequencies,
+        with the region ``|f1 + f2| <= f_Nyq``. The cross-bispectrum is not
+        symmetric under ``f1 <-> f2`` when the input channels differ, so the
+        larger domain is needed.
+
     Returns
     -------
     freq : `np.array`
-        The positive Fourier frequencies (length ``nf``).
+        The Fourier frequencies (length ``nf``). Positive only if
+        ``fullspec=False``, signed and sorted if ``fullspec=True``.
     idx1, idx2 : `np.array`
         ``(nf, nf)`` integer arrays with the FFT bin indices of ``f1`` and
         ``f2``.
     idx3_safe : `np.array`
         ``(nf, nf)`` integer array with the FFT bin index of ``f1 + f2``,
-        clipped to a safe value where the sum is beyond the Nyquist bin (those
+        clipped to a safe in-bounds value where the sum is unresolved (those
         entries are masked out by ``valid``).
     valid : `np.array`
-        ``(nf, nf)`` boolean mask, ``True`` where ``f1 + f2`` is at or below the
-        Nyquist frequency.
+        ``(nf, nf)`` boolean mask, ``True`` where ``f1 + f2`` is resolved.
     """
-    fgt0 = positive_fft_bins(n_bin)
-    freq = fftfreq(n_bin, dt)[fgt0]
-    # FFT bin indices of the positive frequencies (fgt0 starts at bin 1)
-    kbins = np.arange(fgt0.start, fgt0.stop)
     nyquist_bin = n_bin // 2
 
-    idx1, idx2 = np.meshgrid(kbins, kbins, indexing="ij")
-    idx3 = idx1 + idx2
-    valid = idx3 <= nyquist_bin
-    # Clip out-of-range sum indices to 0 so fancy-indexing stays in bounds;
-    # these entries are discarded via ``valid``.
-    idx3_safe = np.where(valid, idx3, 0)
+    if not fullspec:
+        fgt0 = positive_fft_bins(n_bin)
+        freq = fftfreq(n_bin, dt)[fgt0]
+        # FFT bin indices of the positive frequencies (fgt0 starts at bin 1)
+        kbins = np.arange(fgt0.start, fgt0.stop)
+
+        idx1, idx2 = np.meshgrid(kbins, kbins, indexing="ij")
+        idx3 = idx1 + idx2
+        valid = idx3 <= nyquist_bin
+        idx3_safe = np.where(valid, idx3, 0)
+        return freq, idx1, idx2, idx3_safe, valid
+
+    # Full (signed) grid for the cross-bispectrum. Signed non-zero integer
+    # frequency indices, from -kmax to +kmax; the corresponding FFT bin of a
+    # signed index k is ``k % n_bin`` (the FFT is periodic).
+    kmax = (n_bin - 1) // 2
+    kvals = np.concatenate([np.arange(-kmax, 0), np.arange(1, kmax + 1)])
+    freq = kvals / (n_bin * dt)
+
+    k1, k2 = np.meshgrid(kvals, kvals, indexing="ij")
+    k3 = k1 + k2
+    valid = (np.abs(k3) <= nyquist_bin) & (k3 != 0)
+
+    idx1 = k1 % n_bin
+    idx2 = k2 % n_bin
+    idx3_safe = np.where(valid, k3 % n_bin, 0)
     return freq, idx1, idx2, idx3_safe, valid
 
 
@@ -3431,6 +3460,279 @@ def avg_bispectrum_from_timeseries(
         dt,
         bicoherence_norm=bicoherence_norm,
         poisson_subtract=poisson_subtract,
+        silent=silent,
+        return_subbs=return_subbs,
+        save_diagonal=save_diagonal,
+    )
+    if bs is not None:
+        bs.meta["gti"] = gti
+    return bs
+
+
+def avg_cross_bispectrum_from_iterables(
+    flux_iterable1,
+    flux_iterable2,
+    flux_iterable3,
+    dt,
+    bicoherence_norm="kim_powers",
+    poisson_subtract=False,
+    channels_overlap=False,
+    silent=False,
+    return_subbs=False,
+    save_diagonal=False,
+):
+    r"""Cross-bispectrum, cross-bicoherence and cross-biphase from three
+    iterables of simultaneous segments.
+
+    The cross-bispectrum of three (real) channels with per-segment Fourier
+    transforms :math:`X_i`, :math:`Y_i`, :math:`Z_i` is
+
+    .. math::
+
+        B(f_1, f_2) = \frac{1}{m} \sum_{i=0}^{m-1}
+            X_i(f_1)\, Y_i(f_2)\, Z_i^{*}(f_1 + f_2).
+
+    It reduces to the auto-bispectrum (`avg_bispectrum_from_iterable`) when the
+    three iterables yield the same fluxes. Unlike the auto case it is *not*
+    symmetric under ``f1 <-> f2``, so it is sampled on the full signed
+    frequency grid (see `_bispectrum_frequency_grid` with ``fullspec=True``).
+
+    Parameters
+    ----------
+    flux_iterable1, flux_iterable2, flux_iterable3 : iterable of `np.array`
+        Iterables of equal-length flux (counts/bin) arrays, one per segment,
+        for the three channels. They must be simultaneous: segment ``i`` must
+        cover the same time interval in all three. Tuples of ``(flux, error)``
+        are accepted; the error is ignored.
+    dt : float
+        Time resolution of the light curves.
+
+    Other Parameters
+    ----------------
+    bicoherence_norm : {"kim_powers", "sigl_chamoun", "hagihira"}, default "kim_powers"
+        Bicoherence normalization. See `bicoherence_from_sums`.
+    poisson_subtract : bool, default False
+        Subtract the Poisson-noise bias. Only has an effect when
+        ``channels_overlap`` is True (the three channels share the same
+        photons); for independent channels the Poisson noise is uncorrelated
+        between factors and the cross-bispectrum is unbiased, so nothing is
+        subtracted. See `avg_bispectrum_from_iterable` for the correction.
+    channels_overlap : bool, default False
+        Whether the three channels are the same photon stream. Controls the
+        Poisson-noise correction (above). Independent bands: leave False.
+    silent : bool, default False
+        Silence the progress bar.
+    return_subbs, save_diagonal : bool, default False
+        As in `avg_bispectrum_from_iterable`.
+
+    Returns
+    -------
+    results : `astropy.table.Table` or None
+        As in `avg_bispectrum_from_iterable`, with ``nphots`` the geometric
+        mean of the three channels' photon counts. ``None`` if no usable
+        segment triple was found.
+    """
+    local_show_progress = show_progress
+    if silent:
+
+        def local_show_progress(a):
+            return a
+
+    idx1 = idx2 = idx3 = valid = freq = None
+    n_bin = None
+    bispec_sum = None
+    denom1_sum = None  # sum of |X(f1) Y(f2)|^2
+    denom2_sum = None  # sum of |Z(f1+f2)|^2
+    abs_triple_sum = None
+    sum_sq_re = None
+    sum_sq_im = None
+    cos_sum = None
+    sin_sum = None
+
+    sum_of_photons1 = sum_of_photons2 = sum_of_photons3 = 0
+    n_ave = 0
+    subbs = [] if return_subbs else None
+    subbs_diag = [] if save_diagonal else None
+
+    iterables = zip(flux_iterable1, flux_iterable2, flux_iterable3)
+    for flux1, flux2, flux3 in local_show_progress(iterables):
+        fluxes = []
+        skip = False
+        for flux in (flux1, flux2, flux3):
+            if flux is None or np.all(flux == 0):
+                skip = True
+                break
+            if isinstance(flux, tuple):
+                flux = flux[0]
+            fluxes.append(np.asarray(flux))
+        if skip:
+            continue
+
+        f1arr, f2arr, f3arr = fluxes
+        if n_bin is None:
+            n_bin = f1arr.size
+            freq, idx1, idx2, idx3, valid = _bispectrum_frequency_grid(n_bin, dt, fullspec=True)
+
+        ft1 = fft(f1arr)
+        ft2 = fft(f2arr)
+        ft3 = fft(f3arr)
+        sum_of_photons1 += f1arr.sum()
+        sum_of_photons2 += f2arr.sum()
+        sum_of_photons3 += f3arr.sum()
+
+        x1 = ft1[idx1]
+        x2 = ft2[idx2]
+        x3 = ft3[idx3]
+        triple = x1 * x2 * np.conj(x3)
+        denom1 = (x1 * x2).real ** 2 + (x1 * x2).imag ** 2
+        denom2 = x3.real**2 + x3.imag**2
+
+        if poisson_subtract and channels_overlap:
+            # Only the fully-overlapping case has a well-defined Wirnitzer bias
+            # (the three factors are the same photon stream). Independent
+            # channels have no Poisson bias, so nothing is subtracted.
+            p1 = x1.real**2 + x1.imag**2
+            p2 = x2.real**2 + x2.imag**2
+            triple = triple - (p1 + p2 + denom2 - 2.0 * f1arr.sum())
+
+        bispec_sum = sum_if_not_none_or_initialize(bispec_sum, triple)
+        denom1_sum = sum_if_not_none_or_initialize(denom1_sum, denom1)
+        denom2_sum = sum_if_not_none_or_initialize(denom2_sum, denom2)
+        sum_sq_re = sum_if_not_none_or_initialize(sum_sq_re, triple.real**2)
+        sum_sq_im = sum_if_not_none_or_initialize(sum_sq_im, triple.imag**2)
+
+        magnitude = np.abs(triple)
+        abs_triple_sum = sum_if_not_none_or_initialize(abs_triple_sum, magnitude)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            unit = np.where(magnitude > 0, triple / magnitude, 0.0 + 0.0j)
+        cos_sum = sum_if_not_none_or_initialize(cos_sum, unit.real)
+        sin_sum = sum_if_not_none_or_initialize(sin_sum, unit.imag)
+
+        if return_subbs:
+            subbs.append(triple)
+        if save_diagonal:
+            subbs_diag.append(np.diag(triple).copy())
+
+        n_ave += 1
+
+    if bispec_sum is None:
+        return None
+
+    m = n_ave
+    bispec = bispec_sum / m
+
+    abs_bispec_sum = np.abs(bispec_sum)
+    bicoherence = bicoherence_from_sums(
+        bicoherence_norm, abs_bispec_sum, denom1_sum, denom2_sum, abs_triple_sum, valid=valid
+    )
+
+    biphase = np.angle(bispec)
+
+    if m > 1:
+        var_re = np.clip(sum_sq_re / m - bispec.real**2, 0.0, None)
+        var_im = np.clip(sum_sq_im / m - bispec.imag**2, 0.0, None)
+        bispec_err = np.sqrt((var_re + var_im) / m)
+        rbar = np.clip(np.sqrt(cos_sum**2 + sin_sum**2) / m, 1e-12, 1.0)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            circ_std = np.sqrt(-2.0 * np.log(rbar))
+        biphase_err = circ_std / np.sqrt(m)
+    else:
+        bispec_err = np.zeros_like(biphase)
+        biphase_err = np.zeros_like(biphase)
+
+    for arr in (bispec, bispec_err, biphase, biphase_err):
+        arr[~valid] = np.nan
+    bicoherence = np.where(valid, bicoherence, np.nan)
+
+    nphots1 = sum_of_photons1 / m
+    nphots2 = sum_of_photons2 / m
+    nphots3 = sum_of_photons3 / m
+
+    results = Table()
+    results["freq"] = freq
+    results.meta.update(
+        {
+            "freq": freq,
+            "bispec": bispec,
+            "bicoherence": bicoherence,
+            "bicoherence_norm": bicoherence_norm,
+            "poisson_subtract": poisson_subtract and channels_overlap,
+            "channels_overlap": channels_overlap,
+            "biphase": biphase,
+            "bispec_err": bispec_err,
+            "biphase_err": biphase_err,
+            "valid": valid,
+            "bicoh_abs_bispec_sum": abs_bispec_sum,
+            "bicoh_denom1": denom1_sum,
+            "bicoh_denom2": denom2_sum,
+            "bicoh_sum_abs": abs_triple_sum,
+            "n": n_bin,
+            "m": m,
+            "dt": dt,
+            "df": 1 / (dt * n_bin),
+            "nphots1": nphots1,
+            "nphots2": nphots2,
+            "nphots3": nphots3,
+            "nphots": (nphots1 * nphots2 * nphots3) ** (1 / 3),
+            "segment_size": dt * n_bin,
+        }
+    )
+    if return_subbs:
+        results.meta["subbs"] = subbs
+    if save_diagonal:
+        results.meta["subbs_diagonal"] = subbs_diag
+    return results
+
+
+def avg_cross_bispectrum_from_timeseries(
+    times1,
+    times2,
+    times3,
+    gti,
+    segment_size,
+    dt,
+    bicoherence_norm="kim_powers",
+    poisson_subtract=False,
+    channels_overlap=False,
+    silent=False,
+    fluxes1=None,
+    fluxes2=None,
+    fluxes3=None,
+    return_subbs=False,
+    save_diagonal=False,
+):
+    """Average cross-bispectrum from three simultaneous event/light-curve series.
+
+    Splits each channel into segments of length ``segment_size`` on a common
+    GTI and averages the cross-bispectrum over them. See
+    `avg_cross_bispectrum_from_iterables` for the estimator definition.
+
+    Parameters are the three-channel analogues of
+    `avg_bispectrum_from_timeseries`: ``times1/2/3`` and ``fluxes1/2/3`` are the
+    per-channel arrays; all other parameters are as in
+    `avg_cross_bispectrum_from_iterables`.
+    """
+    binned = fluxes1 is not None
+    if gti is not None:
+        gti = np.asarray(gti)
+    if segment_size is not None:
+        segment_size, n_bin = fix_segment_size_to_integer_samples(segment_size, dt)
+    elif binned:
+        n_bin = fluxes1.size
+    else:
+        _, n_bin = fix_segment_size_to_integer_samples(gti.max() - gti.min(), dt)
+
+    fluxes = (fluxes1, fluxes2, fluxes3)
+    iterables = [
+        get_flux_iterable_from_segments(t, gti, segment_size, n_bin, dt=dt, fluxes=f)
+        for t, f in zip((times1, times2, times3), fluxes)
+    ]
+    bs = avg_cross_bispectrum_from_iterables(
+        *iterables,
+        dt,
+        bicoherence_norm=bicoherence_norm,
+        poisson_subtract=poisson_subtract,
+        channels_overlap=channels_overlap,
         silent=silent,
         return_subbs=return_subbs,
         save_diagonal=save_diagonal,

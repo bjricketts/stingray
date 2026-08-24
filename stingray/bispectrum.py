@@ -12,107 +12,100 @@ from .gti import cross_two_gtis
 from .fourier import (
     avg_bispectrum_from_iterable,
     avg_bispectrum_from_timeseries,
+    avg_cross_bispectrum_from_iterables,
+    avg_cross_bispectrum_from_timeseries,
     bicoherence_from_sums,
     get_flux_iterable_from_segments,
 )
 
-__all__ = ["Bispectrum", "AveragedBispectrum"]
+__all__ = [
+    "CrossBispectrum",
+    "AveragedCrossBispectrum",
+    "Bispectrum",
+    "AveragedBispectrum",
+]
 
 
-class Bispectrum(StingrayObject):
+class CrossBispectrum(StingrayObject):
     main_array_attr = "freq"
-    type = "bispectrum"
+    type = "crossbispectrum"
 
-    r"""Make a :class:`Bispectrum` from a (binned) light curve.
+    r"""Make a :class:`CrossBispectrum` from up to three (binned) light curves.
 
-    The bispectrum is a higher-order spectral statistic that measures
-    quadratic phase coupling between Fourier components of a time series. It is
-    computed here with the direct Fourier-decomposition method (Maccarone 2013;
-    Kim & Powers 1979) rather than as the Fourier transform of the third-order
-    cumulant. For ``m`` averaged segments with Fourier transforms
-    :math:`X_i(f)`,
+    The cross-bispectrum is the higher-order analogue of the cross spectrum. It
+    measures quadratic phase coupling *between channels*: for three (real)
+    simultaneous time series with per-segment Fourier transforms :math:`X_i`,
+    :math:`Y_i`, :math:`Z_i`,
 
     .. math::
 
         B(f_1, f_2) = \frac{1}{m} \sum_{i=0}^{m-1}
-            X_i(f_1)\, X_i(f_2)\, X_i^{*}(f_1 + f_2)
+            X_i(f_1)\, Y_i(f_2)\, Z_i^{*}(f_1 + f_2).
 
-    You can also make an empty :class:`Bispectrum` object to populate with your
-    own data.
+    The :class:`Bispectrum` (auto-bispectrum) is the special case where the
+    three inputs are the same light curve, in the same way that
+    :class:`stingray.Powerspectrum` is the auto case of
+    :class:`stingray.Crossspectrum`. In X-ray timing the usual use is two energy
+    bands: e.g. testing whether the variability at ``f1 + f2`` in one band is
+    quadratically coupled to ``f1``, ``f2`` in another.
 
-    A single :class:`Bispectrum` uses the whole light curve as one segment. To
-    get a statistically meaningful bispectrum, bicoherence and biphase you
-    normally want :class:`AveragedBispectrum`, which averages over many
-    segments.
+    Unlike the auto-bispectrum, the cross-bispectrum is **not** symmetric under
+    ``f1 <-> f2`` (because ``X(f1) Y(f2)`` is not), so it is sampled on the full
+    signed frequency plane (``f1``, ``f2`` positive and negative, with
+    ``|f1 + f2| <= f_Nyq``) rather than the Nyquist triangle.
+
+    You can also make an empty :class:`CrossBispectrum` object to populate with
+    your own data. A single object (no ``segment_size``) uses the whole light
+    curve as one segment; for a statistically meaningful cross-bicoherence and
+    cross-biphase you normally want :class:`AveragedCrossBispectrum`.
 
     Parameters
     ----------
-    data : :class:`stingray.Lightcurve` or :class:`stingray.events.EventList`, optional, default ``None``
-        The light curve or event list to be Fourier-transformed. If an
-        :class:`EventList` is given, ``dt`` must be specified.
+    data1, data2, data3 : :class:`stingray.Lightcurve` or :class:`stingray.events.EventList`, optional
+        The three channels, mapped to the factors ``X(f1)``, ``Y(f2)`` and
+        ``Z(f1+f2)`` respectively. ``data2`` and ``data3`` default to ``data1``
+        (recovering the auto-bispectrum). All three must be simultaneous (same
+        ``dt``, same time bins, compatible GTIs). If :class:`EventList`, ``dt``
+        must be specified.
 
     Other Parameters
     ----------------
     dt : float
-        The time resolution of the light curve. Only needed when the input is
-        an :class:`EventList`.
+        The time resolution of the light curves. Only needed for
+        :class:`EventList` inputs.
+
+    gti : ``[[gti0_0, gti0_1], ...]``
+        Good time intervals. Defaults to the intersection of the inputs' GTIs.
 
     bicoherence_norm : {"kim_powers", "sigl_chamoun", "hagihira"}, default "kim_powers"
-        Which normalization to use for the ``bicoherence`` attribute. All lie
-        in ``[0, 1]``. With :math:`T_i = X_i(f_1) X_i(f_2) X_i^{*}(f_1+f_2)`:
-
-        ``"kim_powers"``
-            The **squared** bicoherence of Kim & Powers (1979) -- the
-            plasma-physics standard (Nagashima 2006) and the form in
-            Maccarone (2013):
-            :math:`b^2 = |\sum_i T_i|^2 / (\sum_i |X_i(f_1)X_i(f_2)|^2 \sum_i |X_i(f_1+f_2)|^2)`.
-        ``"sigl_chamoun"``
-            Sigl & Chamoun (1994); the unsquared square root of the Kim &
-            Powers value,
-            :math:`b = |\sum_i T_i| / \sqrt{\sum_i |X_i(f_1)X_i(f_2)|^2 \sum_i |X_i(f_1+f_2)|^2}`.
-        ``"hagihira"``
-            Hagihira (2001) / Hayashi (2007); normalizes by the summed
-            magnitude of the per-segment triple products,
-            :math:`b = |\sum_i T_i| / \sum_i |T_i|`.
-
-        Any of these can be recomputed after the fact with
-        :meth:`recompute_bicoherence` (no FFTs are redone).
+        Which normalization to use for the ``bicoherence`` attribute. See
+        :class:`Bispectrum` for the definitions; the cross denominators are
+        :math:`\sum_i |X_i(f_1) Y_i(f_2)|^2` and :math:`\sum_i |Z_i(f_1+f_2)|^2`.
 
     poisson_subtract : bool, default False
-        If True, subtract the Poisson-noise bias from each segment before
-        averaging, following Wirnitzer (1985) (see Nathan et al. 2022;
-        Maccarone 2013):
-        :math:`X(f_1) X(f_2) X^{*}(f_1+f_2) - |X(f_1)|^2 - |X(f_2)|^2 - |X(f_1+f_2)|^2 + 2N`,
-        with :math:`N` the photon count in the segment. Poisson noise biases the
-        real part of the bispectrum (and hence the biphase), so this is
-        recommended for photon-counting light curves given in counts. Only
-        appropriate for Poisson data.
+        Subtract the Poisson-noise bias. Only has an effect when
+        ``channels_overlap`` is True; for independent channels the Poisson noise
+        is uncorrelated between factors and the cross-bispectrum is unbiased.
+
+    channels_overlap : bool, default False
+        Whether the three channels are the same photon stream. Independent
+        energy bands (the usual cross case): leave ``False``.
 
     skip_checks : bool, default False
-        Skip initial checks, for speed or other reasons (you need to trust your
-        inputs!).
-
-    lc : :class:`stingray.Lightcurve`, optional
-        For backwards compatibility only. Like ``data``, but no
-        :class:`EventList` allowed. Deprecated.
+        Skip initial checks, for speed or other reasons.
 
     Attributes
     ----------
     freq : numpy.ndarray
-        The array of positive Fourier frequencies that the transform samples.
+        The (signed) Fourier frequencies the transform samples.
 
     bispec : numpy.ndarray
-        The complex bispectrum, an ``nf x nf`` matrix indexed by
-        ``(freq, freq)``. The redundant/unresolved region (where
-        ``f1 + f2`` exceeds the Nyquist frequency) is set to ``NaN``.
+        The complex cross-bispectrum, an ``nf x nf`` matrix. The unresolved
+        region (``|f1 + f2| > f_Nyq``) is set to ``NaN``.
 
     bicoherence : numpy.ndarray
-        The bicoherence, a real ``nf x nf`` matrix in ``[0, 1]`` (0 = no
-        quadratic coupling, 1 = total coupling), computed with the
-        normalization given by ``bicoherence_norm``. Note the default
-        ``"kim_powers"`` returns the **squared** bicoherence. Only meaningful
-        once several segments are averaged. Use :meth:`recompute_bicoherence`
-        to obtain a different normalization.
+        The cross-bicoherence in ``[0, 1]``, in the ``bicoherence_norm``
+        convention. Use :meth:`recompute_bicoherence` for a different one.
 
     bicoherence_norm : str
         The normalization used for ``bicoherence``.
@@ -120,111 +113,112 @@ class Bispectrum(StingrayObject):
     poisson_subtracted : bool
         Whether the Poisson-noise bias was subtracted.
 
+    channels_overlap : bool
+        Whether the input channels share the same photons.
+
     biphase : numpy.ndarray
-        The phase of the bispectrum, an ``nf x nf`` matrix defined over the
-        full :math:`2\pi` interval.
+        The phase of the cross-bispectrum, defined over the full
+        :math:`2\pi` interval. Also available as ``bispec_phase``.
 
     bispec_mag : numpy.ndarray
-        Magnitude of the bispectrum, ``|bispec|``.
+        Magnitude of the cross-bispectrum.
 
-    bispec_phase : numpy.ndarray
-        Alias of ``biphase``.
-
-    bispec_err : numpy.ndarray
-        Approximate 1-sigma uncertainty on ``bispec`` (standard error of the
-        mean of the per-segment triple products). Zero for a single segment.
-
-    biphase_err : numpy.ndarray
-        Approximate 1-sigma uncertainty on ``biphase`` from circular statistics
-        (Fisher 1993). Zero for a single segment.
+    bispec_err, biphase_err : numpy.ndarray
+        Approximate 1-sigma uncertainties (as in :class:`Bispectrum`).
 
     df : float
         The frequency resolution.
 
     m : int
-        The number of averaged bispectra.
+        The number of averaged cross-bispectra.
 
     n : int
         The number of data points in each segment.
 
+    nphots1, nphots2, nphots3 : float
+        The mean photon count per segment in each channel.
+
     nphots : float
-        The total number of photons (mean per segment).
+        The geometric mean of ``nphots1``, ``nphots2`` and ``nphots3``.
 
     References
     ----------
-    1) T. J. Maccarone, "The biphase explained: understanding the asymmetries
-       in coupled Fourier components of astronomical time series", MNRAS 435,
-       3547 (2013).
+    1) T. J. Maccarone, MNRAS 435, 3547 (2013).
 
-    2) Y. C. Kim and E. J. Powers, "Digital Bispectral Analysis and Its
-       Applications to Nonlinear Wave Interactions", IEEE Transactions on
-       Plasma Science, PS-7, 120 (1979).
-
-    Examples
-    --------
-    >>> lc = Lightcurve(np.arange(64), np.random.default_rng(0).poisson(10, 64))
-    >>> bs = Bispectrum(lc)
-    >>> assert bs.bispec.shape[0] == bs.freq.size
-    >>> assert bs.m == 1
+    2) Y. C. Kim and E. J. Powers, IEEE Trans. Plasma Sci. PS-7, 120 (1979).
     """
 
     def __init__(
         self,
-        data=None,
+        data1=None,
+        data2=None,
+        data3=None,
         dt=None,
         gti=None,
         bicoherence_norm="kim_powers",
         poisson_subtract=False,
+        channels_overlap=False,
         skip_checks=False,
-        lc=None,
     ):
         self._type = None
-        if lc is not None:
-            warnings.warn("The lc keyword is now deprecated. Use data instead", DeprecationWarning)
-        if data is None:
-            data = lc
+        # Missing channels default to data1 (the auto-bispectrum).
+        if data1 is not None:
+            if data2 is None:
+                data2 = data1
+            if data3 is None:
+                data3 = data1
 
-        good_input = data is not None
+        good_input = data1 is not None
         if good_input and not skip_checks:
-            good_input = self.initial_checks(data=data, dt=dt)
+            good_input = self.initial_checks(data1=data1, data2=data2, data3=data3, dt=dt)
 
         self.dt = dt
         self.gti = gti
         self.bicoherence_norm = bicoherence_norm
-        self.poisson_subtracted = poisson_subtract
+        self.channels_overlap = channels_overlap
+        self.poisson_subtracted = poisson_subtract and channels_overlap
 
         if not good_input:
             return self._initialize_empty()
 
         return self._initialize_from_any_input(
-            data,
+            data1,
+            data2,
+            data3,
             dt=dt,
             gti=gti,
             bicoherence_norm=bicoherence_norm,
             poisson_subtract=poisson_subtract,
+            channels_overlap=channels_overlap,
         )
 
-    def initial_checks(self, data=None, dt=None, segment_size=None):
+    def initial_checks(self, data1=None, data2=None, data3=None, dt=None, segment_size=None):
         """Run basic checks on the inputs.
 
-        Returns ``True`` if the input can be used to build a bispectrum,
-        raises otherwise. An empty (``None``) input returns ``False`` so that
+        Returns ``True`` if the inputs can be used to build a cross-bispectrum,
+        raises otherwise. An empty (``None``) ``data1`` returns ``False`` so that
         an empty object is created.
         """
-        if data is None:
+        if data1 is None:
             return False
 
-        if isinstance(data, EventList):
-            if dt is None:
-                raise ValueError(
-                    "If the input is an event list, the time resolution dt " "must be specified."
-                )
-        elif isinstance(data, Lightcurve):
-            pass
-        elif isinstance(data, (tuple, list, Generator)):
-            pass
-        else:
-            raise TypeError(f"Bad input to Bispectrum: {type(data)}")
+        inputs = (data1, data2, data3)
+        for data in inputs:
+            if isinstance(data, EventList):
+                if dt is None:
+                    raise ValueError(
+                        "If the input is an event list, the time resolution dt "
+                        "must be specified."
+                    )
+            elif isinstance(data, Lightcurve):
+                pass
+            elif isinstance(data, (tuple, list, Generator)):
+                pass
+            else:
+                raise TypeError(f"Bad input to CrossBispectrum: {type(data)}")
+
+        if not (isinstance(data1, type(data2)) and isinstance(data1, type(data3))):
+            raise ValueError("The input channels must all be of the same kind.")
 
         if segment_size is not None and dt is not None and segment_size < 2 * dt:
             raise ValueError("segment_size must be at least 2 * dt.")
@@ -233,58 +227,42 @@ class Bispectrum(StingrayObject):
 
     def _initialize_from_any_input(
         self,
-        data,
+        data1,
+        data2,
+        data3,
         dt=None,
         segment_size=None,
         gti=None,
         bicoherence_norm="kim_powers",
         poisson_subtract=False,
+        channels_overlap=False,
         silent=False,
         save_all=False,
         save_diagonal=False,
     ):
-        """Initialize the object, dispatching on the type of ``data``."""
-        if isinstance(data, EventList):
-            spec = bispectrum_from_events(
-                data,
-                dt,
-                segment_size=segment_size,
-                gti=gti,
-                bicoherence_norm=bicoherence_norm,
-                poisson_subtract=poisson_subtract,
-                silent=silent,
-                save_all=save_all,
-                save_diagonal=save_diagonal,
-            )
-        elif isinstance(data, Lightcurve):
-            spec = bispectrum_from_lightcurve(
-                data,
-                segment_size=segment_size,
-                gti=gti,
-                bicoherence_norm=bicoherence_norm,
-                poisson_subtract=poisson_subtract,
-                silent=silent,
-                save_all=save_all,
-                save_diagonal=save_diagonal,
-            )
-        elif isinstance(data, (tuple, list, Generator)):
-            data = list(data)
-            if len(data) == 0 or not isinstance(data[0], Lightcurve):  # pragma: no cover
-                raise TypeError(f"Bad inputs to Bispectrum: {type(data[0]) if data else None}")
-            dt = data[0].dt
-            spec = bispectrum_from_lc_iterable(
-                data,
-                dt,
-                segment_size=segment_size,
-                gti=gti,
-                bicoherence_norm=bicoherence_norm,
-                poisson_subtract=poisson_subtract,
-                silent=silent,
-                save_all=save_all,
-                save_diagonal=save_diagonal,
-            )
+        """Initialize the object, dispatching on the type of ``data1``."""
+        kwargs = dict(
+            segment_size=segment_size,
+            gti=gti,
+            bicoherence_norm=bicoherence_norm,
+            poisson_subtract=poisson_subtract,
+            channels_overlap=channels_overlap,
+            silent=silent,
+            save_all=save_all,
+            save_diagonal=save_diagonal,
+        )
+        if isinstance(data1, EventList):
+            spec = crossbispectrum_from_events(data1, data2, data3, dt, **kwargs)
+        elif isinstance(data1, Lightcurve):
+            spec = crossbispectrum_from_lightcurve(data1, data2, data3, **kwargs)
+        elif isinstance(data1, (tuple, list, Generator)):
+            data1, data2, data3 = list(data1), list(data2), list(data3)
+            if len(data1) == 0 or not isinstance(data1[0], Lightcurve):  # pragma: no cover
+                raise TypeError("Bad inputs to CrossBispectrum")
+            dt = data1[0].dt
+            spec = crossbispectrum_from_lc_iterable(data1, data2, data3, dt, **kwargs)
         else:  # pragma: no cover
-            raise TypeError(f"Bad inputs to Bispectrum: {type(data)}")
+            raise TypeError(f"Bad inputs to CrossBispectrum: {type(data1)}")
 
         for key, val in spec.__dict__.items():
             setattr(self, key, val)
@@ -297,6 +275,7 @@ class Bispectrum(StingrayObject):
         self.bicoherence = None
         self.bicoherence_norm = getattr(self, "bicoherence_norm", "kim_powers")
         self.poisson_subtracted = getattr(self, "poisson_subtracted", False)
+        self.channels_overlap = getattr(self, "channels_overlap", False)
         self.biphase = None
         self.bispec_mag = None
         self.bispec_phase = None
@@ -314,6 +293,9 @@ class Bispectrum(StingrayObject):
         self.m = 1
         self.n = None
         self.nphots = None
+        self.nphots1 = None
+        self.nphots2 = None
+        self.nphots3 = None
         self.segment_size = None
         self.gti = None
         return
@@ -322,8 +304,7 @@ class Bispectrum(StingrayObject):
         """Recompute the bicoherence under a different normalization.
 
         Uses the accumulated bispectrum sums stored on the object, so no FFTs
-        are recomputed. See :class:`Bispectrum` for the definition of each
-        normalization.
+        are recomputed. See :class:`Bispectrum` for the definitions.
 
         Parameters
         ----------
@@ -342,7 +323,7 @@ class Bispectrum(StingrayObject):
             The recomputed bicoherence.
         """
         if getattr(self, "_bicoh_denom1", None) is None:
-            raise ValueError("This Bispectrum has no data to compute a bicoherence from.")
+            raise ValueError("This bispectrum has no data to compute a bicoherence from.")
         bicoh = bicoherence_from_sums(
             norm,
             self._bicoh_abs_bispec_sum,
@@ -358,192 +339,89 @@ class Bispectrum(StingrayObject):
 
     @staticmethod
     def from_lightcurve(
-        lc, gti=None, bicoherence_norm="kim_powers", poisson_subtract=False, silent=False
+        lc1,
+        lc2=None,
+        lc3=None,
+        gti=None,
+        bicoherence_norm="kim_powers",
+        poisson_subtract=False,
+        channels_overlap=False,
+        silent=False,
     ):
-        """Calculate a :class:`Bispectrum` from a light curve.
-
-        Parameters
-        ----------
-        lc : :class:`stingray.Lightcurve`
-            Light curve to be analyzed.
-
-        Other Parameters
-        ----------------
-        gti : ``[[gti0_0, gti0_1], ...]``
-            Good time intervals.
-        bicoherence_norm : {"kim_powers", "sigl_chamoun", "hagihira"}, default "kim_powers"
-            The bicoherence normalization (see :class:`Bispectrum`).
-        silent : bool, default False
-            Silence the progress bars.
-        """
-        return bispectrum_from_lightcurve(
-            lc,
+        """Calculate a :class:`CrossBispectrum` from light curves."""
+        return crossbispectrum_from_lightcurve(
+            lc1,
+            lc2,
+            lc3,
             gti=gti,
             bicoherence_norm=bicoherence_norm,
             poisson_subtract=poisson_subtract,
+            channels_overlap=channels_overlap,
             silent=silent,
         )
 
     @staticmethod
     def from_events(
-        events, dt, gti=None, bicoherence_norm="kim_powers", poisson_subtract=False, silent=False
+        events1,
+        events2=None,
+        events3=None,
+        dt=None,
+        gti=None,
+        bicoherence_norm="kim_powers",
+        poisson_subtract=False,
+        channels_overlap=False,
+        silent=False,
     ):
-        """Calculate a :class:`Bispectrum` from an event list.
-
-        Parameters
-        ----------
-        events : :class:`stingray.EventList`
-            Event list to be analyzed.
-        dt : float
-            The time resolution of the intermediate light curve (sets the
-            Nyquist frequency).
-
-        Other Parameters
-        ----------------
-        gti : ``[[gti0_0, gti0_1], ...]``
-            Good time intervals.
-        bicoherence_norm : {"kim_powers", "sigl_chamoun", "hagihira"}, default "kim_powers"
-            The bicoherence normalization (see :class:`Bispectrum`).
-        silent : bool, default False
-            Silence the progress bars.
-        """
-        return bispectrum_from_events(
-            events,
+        """Calculate a :class:`CrossBispectrum` from event lists."""
+        return crossbispectrum_from_events(
+            events1,
+            events2,
+            events3,
             dt,
             gti=gti,
             bicoherence_norm=bicoherence_norm,
             poisson_subtract=poisson_subtract,
+            channels_overlap=channels_overlap,
             silent=silent,
         )
 
     @staticmethod
     def from_time_array(
-        times, dt, gti=None, bicoherence_norm="kim_powers", poisson_subtract=False, silent=False
+        times1,
+        times2,
+        times3,
+        dt,
+        gti=None,
+        bicoherence_norm="kim_powers",
+        poisson_subtract=False,
+        channels_overlap=False,
+        silent=False,
     ):
-        """Calculate a :class:`Bispectrum` from an array of event times.
-
-        Parameters
-        ----------
-        times : `np.array`
-            Event arrival times.
-        dt : float
-            The time resolution of the intermediate light curve.
-
-        Other Parameters
-        ----------------
-        gti : ``[[gti0_0, gti0_1], ...]``
-            Good time intervals.
-        bicoherence_norm : {"kim_powers", "sigl_chamoun", "hagihira"}, default "kim_powers"
-            The bicoherence normalization (see :class:`Bispectrum`).
-        silent : bool, default False
-            Silence the progress bars.
-        """
-        return bispectrum_from_time_array(
-            times,
+        """Calculate a :class:`CrossBispectrum` from arrays of event times."""
+        return crossbispectrum_from_time_array(
+            times1,
+            times2,
+            times3,
             dt,
             gti=gti,
             bicoherence_norm=bicoherence_norm,
             poisson_subtract=poisson_subtract,
-            silent=silent,
-        )
-
-    @staticmethod
-    def from_stingray_timeseries(
-        ts,
-        flux_attr,
-        error_flux_attr=None,
-        gti=None,
-        bicoherence_norm="kim_powers",
-        poisson_subtract=False,
-        silent=False,
-    ):
-        """Calculate a :class:`Bispectrum` from a time series.
-
-        Parameters
-        ----------
-        ts : :class:`stingray.StingrayTimeseries`
-            Input time series.
-        flux_attr : str
-            The attribute of the time series to use as flux.
-
-        Other Parameters
-        ----------------
-        error_flux_attr : str
-            The attribute of the time series to use as error bar.
-        gti : ``[[gti0_0, gti0_1], ...]``
-            Good time intervals.
-        bicoherence_norm : {"kim_powers", "sigl_chamoun", "hagihira"}, default "kim_powers"
-            The bicoherence normalization (see :class:`Bispectrum`).
-        silent : bool, default False
-            Silence the progress bars.
-        """
-        return bispectrum_from_stingray_timeseries(
-            ts,
-            flux_attr,
-            error_flux_attr=error_flux_attr,
-            gti=gti,
-            bicoherence_norm=bicoherence_norm,
-            poisson_subtract=poisson_subtract,
+            channels_overlap=channels_overlap,
             silent=silent,
         )
 
     def plot_mag(self, ax=None, save=False, filename=None):
-        """Plot the magnitude of the bispectrum as a function of frequency.
-
-        Parameters
-        ----------
-        ax : ``matplotlib.axes.Axes``, default ``None``
-            The axes to plot onto. A new one is created if ``None``.
-        save : bool, default ``False``
-            If ``True``, save the figure to ``filename``.
-        filename : str, default ``None``
-            File name to save the figure to. Defaults to ``bispec_mag.png``.
-
-        Returns
-        -------
-        ax : ``matplotlib.axes.Axes``
-            The axes with the plot.
-        """
+        """Plot the magnitude of the bispectrum as a function of frequency."""
         return self._plot_matrix(
             self.bispec_mag, "Bispectrum Magnitude", ax, save, filename, "bispec_mag.png"
         )
 
     def plot_phase(self, ax=None, save=False, filename=None):
-        """Plot the biphase as a function of frequency.
-
-        Parameters
-        ----------
-        ax : ``matplotlib.axes.Axes``, default ``None``
-            The axes to plot onto. A new one is created if ``None``.
-        save : bool, default ``False``
-            If ``True``, save the figure to ``filename``.
-        filename : str, default ``None``
-            File name to save the figure to. Defaults to ``bispec_phase.png``.
-
-        Returns
-        -------
-        ax : ``matplotlib.axes.Axes``
-            The axes with the plot.
-        """
+        """Plot the biphase as a function of frequency."""
         return self._plot_matrix(self.biphase, "Biphase", ax, save, filename, "bispec_phase.png")
 
     def plot_bicoherence(self, ax=None, save=False, filename=None):
-        """Plot the bicoherence as a function of frequency.
-
-        Parameters
-        ----------
-        ax : ``matplotlib.axes.Axes``, default ``None``
-            The axes to plot onto. A new one is created if ``None``.
-        save : bool, default ``False``
-            If ``True``, save the figure to ``filename``.
-        filename : str, default ``None``
-            File name to save the figure to. Defaults to ``bicoherence.png``.
-
-        Returns
-        -------
-        ax : ``matplotlib.axes.Axes``
-            The axes with the plot.
-        """
+        """Plot the bicoherence as a function of frequency."""
         return self._plot_matrix(
             self.bicoherence, "Bicoherence", ax, save, filename, "bicoherence.png"
         )
@@ -551,12 +429,14 @@ class Bispectrum(StingrayObject):
     def _plot_matrix(self, matrix, title, ax, save, filename, default_filename):
         """Shared helper for the 2D bispectrum plots."""
         if matrix is None:
-            raise ValueError("This Bispectrum has no data to plot.")
+            raise ValueError("This bispectrum has no data to plot.")
 
         if ax is None:
             _, ax = plt.subplots()
 
-        cont = ax.contourf(self.freq, self.freq, matrix, 100, cmap=plt.cm.Spectral_r)
+        # ``matrix[i, j]`` is indexed (f1, f2); transpose so that f1 is on the
+        # x-axis (matters only for a non-symmetric, i.e. cross, bispectrum).
+        cont = ax.contourf(self.freq, self.freq, matrix.T, 100, cmap=plt.cm.Spectral_r)
         ax.figure.colorbar(cont, ax=ax)
         ax.set_title(title)
         ax.set_xlabel("Frequency 1 (Hz)")
@@ -578,41 +458,35 @@ class Bispectrum(StingrayObject):
         save=False,
         filename=None,
     ):
-        r"""Draw a "jellyfish plot" of the autobispectrum (Nathan et al. 2022).
+        r"""Draw a "jellyfish plot" of the (auto-)bispectrum (Nathan et al. 2022).
 
-        For each frequency :math:`\nu` on the autobispectrum diagonal
-        (:math:`f_1 = f_2 = \nu`, which couples :math:`\nu` and its harmonic
-        :math:`2\nu`), the per-segment triple products
-        :math:`X_i(\nu) X_i(\nu) X_i^{*}(2\nu)` are accumulated segment by
-        segment and the running (cumulative) sum is traced as a path in the
-        complex plane. Each path is normalized so that the amplitude of its
-        end point equals the bicoherence (Sigl & Chamoun convention), and its
-        angle is the biphase.
+        For each frequency :math:`\nu` on the diagonal (:math:`f_1 = f_2 = \nu`,
+        which couples :math:`\nu` and its harmonic :math:`2\nu`), the per-segment
+        triple products are accumulated segment by segment and the running
+        (cumulative) sum is traced as a path in the complex plane, normalized so
+        the amplitude of its end point is the bicoherence (Sigl & Chamoun
+        convention) and its angle is the biphase.
 
-        Frequencies that are quadratically phase-coupled produce per-segment
-        contributions that point in a consistent direction, so their path walks
-        steadily outward into a "tentacle"; uncoupled frequencies random-walk
-        near the origin, forming the "body". Reference circles of constant
-        bicoherence give the scale.
+        Phase-coupled frequencies walk outward into a "tentacle"; uncoupled ones
+        random-walk near the origin, forming the "body". Reference circles of
+        constant bicoherence give the scale.
 
-        This requires an averaged bispectrum built with ``save_diagonal=True``
+        Requires an averaged (cross-)bispectrum built with ``save_diagonal=True``
         (which keeps only the diagonal the plot needs) or ``save_all=True``.
 
         Parameters
         ----------
         f0 : float, optional
             A reference (e.g. QPO fundamental) frequency to highlight. The
-            diagonal path closest to ``f0`` is drawn in ``fundamental_color``
-            (it couples the fundamental and its harmonic), and the path closest
-            to ``f0 / 2`` in ``subharmonic_color`` (the subharmonic and the
-            fundamental). If ``None``, every path is drawn in ``other_color``.
+            diagonal path closest to ``f0`` is drawn in ``fundamental_color``,
+            and the path closest to ``f0 / 2`` in ``subharmonic_color``. If
+            ``None``, every path is drawn in ``other_color``.
 
         Other Parameters
         ----------------
         freqs : iterable of float, optional
             The diagonal frequencies to draw. Defaults to every resolved
-            diagonal frequency (those for which :math:`2\nu` is at or below the
-            Nyquist frequency).
+            diagonal frequency.
         bicoherence_levels : iterable of float, default ``(0.01, 0.05)``
             Radii, in bicoherence units, of the reference circles.
         fundamental_color, subharmonic_color, other_color : color
@@ -628,22 +502,16 @@ class Bispectrum(StingrayObject):
         -------
         ax : ``matplotlib.axes.Axes``
             The axes with the plot.
-
-        Notes
-        -----
-        The bispectrum is biased by Poisson noise; this plot shows the raw
-        (uncorrected) bispectrum, so paths in the low-bicoherence body carry a
-        noise contribution.
         """
-        # The jellyfish only needs the per-segment autobispectrum diagonal.
-        # Prefer the light ``bispec_diagonal`` store (save_diagonal=True); fall
-        # back to the full ``bispec_all`` cube (save_all=True).
+        # The jellyfish only needs the per-segment diagonal. Prefer the light
+        # ``bispec_diagonal`` store (save_diagonal=True); fall back to the full
+        # ``bispec_all`` cube (save_all=True).
         diag_store = getattr(self, "bispec_diagonal", None)
         full_store = getattr(self, "bispec_all", None)
         if diag_store is None and full_store is None:
             raise ValueError(
                 "plot_jellyfish needs the per-segment bispectra. Build the "
-                "AveragedBispectrum with save_diagonal=True (light) or save_all=True."
+                "averaged bispectrum with save_diagonal=True (light) or save_all=True."
             )
 
         nf = self.freq.size
@@ -726,68 +594,412 @@ class Bispectrum(StingrayObject):
         return ax
 
 
-class AveragedBispectrum(Bispectrum):
-    type = "bispectrum"
+class AveragedCrossBispectrum(CrossBispectrum):
+    type = "crossbispectrum"
 
-    r"""Make an averaged bispectrum from a light curve or event list.
+    r"""Make an averaged cross-bispectrum from three simultaneous light curves.
 
-    The light curve is split into segments of length ``segment_size``, a
-    bispectrum is computed for each segment, and the results are averaged (see
-    :class:`Bispectrum` for the estimator definition). Averaging is what makes
-    the bicoherence and biphase statistically meaningful.
+    Each channel is split into segments of length ``segment_size`` on a common
+    GTI, a cross-bispectrum is computed per segment, and the results are
+    averaged. See :class:`CrossBispectrum` for the estimator definition, and
+    :class:`AveragedBispectrum` for the (auto) memory-saving ``save_all`` /
+    ``save_diagonal`` options, which apply here unchanged.
 
     Parameters
     ----------
-    data : :class:`stingray.Lightcurve`, iterable of :class:`stingray.Lightcurve`, or :class:`stingray.events.EventList`
-        The light curve data to be Fourier-transformed.
+    data1, data2, data3 : :class:`stingray.Lightcurve`, iterable of them, or :class:`stingray.events.EventList`
+        The three channels. ``data2``/``data3`` default to ``data1``.
 
     segment_size : float
-        The size, in seconds, of each segment to average. If the total duration
-        is not an integer multiple of ``segment_size``, the leftover at the end
-        is discarded.
+        The size, in seconds, of each averaged segment.
 
     Other Parameters
     ----------------
-    gti : 2-d float array
-        ``[[gti0_0, gti0_1], ...]`` -- Good time intervals.
+    See :class:`CrossBispectrum`, plus ``dt``, ``silent``, ``save_all`` and
+    ``save_diagonal`` as in :class:`AveragedBispectrum`.
+    """
 
+    def __init__(
+        self,
+        data1=None,
+        data2=None,
+        data3=None,
+        segment_size=None,
+        gti=None,
+        dt=None,
+        bicoherence_norm="kim_powers",
+        poisson_subtract=False,
+        channels_overlap=False,
+        silent=False,
+        save_all=False,
+        save_diagonal=False,
+        skip_checks=False,
+    ):
+        self._type = None
+        if data1 is not None:
+            if data2 is None:
+                data2 = data1
+            if data3 is None:
+                data3 = data1
+
+        good_input = data1 is not None
+        if good_input and not skip_checks:
+            good_input = self.initial_checks(
+                data1=data1, data2=data2, data3=data3, dt=dt, segment_size=segment_size
+            )
+
+        self.dt = dt
+        self.gti = gti
+        self.bicoherence_norm = bicoherence_norm
+        self.channels_overlap = channels_overlap
+        self.poisson_subtracted = poisson_subtract and channels_overlap
+        self.segment_size = segment_size
+        self.save_all = save_all
+
+        if not good_input:
+            return self._initialize_empty()
+
+        return self._initialize_from_any_input(
+            data1,
+            data2,
+            data3,
+            dt=dt,
+            segment_size=segment_size,
+            gti=gti,
+            bicoherence_norm=bicoherence_norm,
+            poisson_subtract=poisson_subtract,
+            channels_overlap=channels_overlap,
+            silent=silent,
+            save_all=save_all,
+            save_diagonal=save_diagonal,
+        )
+
+    def initial_checks(self, data1=None, data2=None, data3=None, dt=None, segment_size=None):
+        if data1 is not None and segment_size is None:
+            raise ValueError("segment_size must be specified for an averaged bispectrum.")
+        return super().initial_checks(
+            data1=data1, data2=data2, data3=data3, dt=dt, segment_size=segment_size
+        )
+
+    @staticmethod
+    def from_lightcurve(
+        lc1,
+        lc2,
+        lc3,
+        segment_size,
+        gti=None,
+        bicoherence_norm="kim_powers",
+        poisson_subtract=False,
+        channels_overlap=False,
+        silent=False,
+        save_all=False,
+        save_diagonal=False,
+    ):
+        """Calculate an :class:`AveragedCrossBispectrum` from light curves."""
+        return crossbispectrum_from_lightcurve(
+            lc1,
+            lc2,
+            lc3,
+            segment_size=segment_size,
+            gti=gti,
+            bicoherence_norm=bicoherence_norm,
+            poisson_subtract=poisson_subtract,
+            channels_overlap=channels_overlap,
+            silent=silent,
+            save_all=save_all,
+            save_diagonal=save_diagonal,
+        )
+
+    @staticmethod
+    def from_events(
+        events1,
+        events2,
+        events3,
+        dt,
+        segment_size,
+        gti=None,
+        bicoherence_norm="kim_powers",
+        poisson_subtract=False,
+        channels_overlap=False,
+        silent=False,
+        save_all=False,
+        save_diagonal=False,
+    ):
+        """Calculate an :class:`AveragedCrossBispectrum` from event lists."""
+        return crossbispectrum_from_events(
+            events1,
+            events2,
+            events3,
+            dt,
+            segment_size=segment_size,
+            gti=gti,
+            bicoherence_norm=bicoherence_norm,
+            poisson_subtract=poisson_subtract,
+            channels_overlap=channels_overlap,
+            silent=silent,
+            save_all=save_all,
+            save_diagonal=save_diagonal,
+        )
+
+
+class Bispectrum(CrossBispectrum):
+    type = "bispectrum"
+
+    r"""Make a :class:`Bispectrum` (auto-bispectrum) from a (binned) light curve.
+
+    The auto-bispectrum is the special case of the :class:`CrossBispectrum` in
+    which the three inputs are the same light curve, exactly as
+    :class:`stingray.Powerspectrum` is the auto case of
+    :class:`stingray.Crossspectrum`. It measures quadratic phase coupling within
+    a single time series. For ``m`` averaged segments,
+
+    .. math::
+
+        B(f_1, f_2) = \frac{1}{m} \sum_{i=0}^{m-1}
+            X_i(f_1)\, X_i(f_2)\, X_i^{*}(f_1 + f_2)
+
+    Because ``X(f1) X(f2)`` is symmetric under ``f1 <-> f2``, the auto case is
+    sampled only on the positive Nyquist triangle (unlike the full signed grid
+    of the cross case).
+
+    A single :class:`Bispectrum` uses the whole light curve as one segment; use
+    :class:`AveragedBispectrum` for a statistically meaningful bicoherence and
+    biphase.
+
+    Parameters
+    ----------
+    data : :class:`stingray.Lightcurve` or :class:`stingray.events.EventList`, optional
+        The light curve or event list to be Fourier-transformed. If an
+        :class:`EventList` is given, ``dt`` must be specified.
+
+    Other Parameters
+    ----------------
     dt : float
-        The time resolution of the light curve. Only needed when the input is
-        an :class:`EventList`.
+        The time resolution of the light curve. Only needed for an
+        :class:`EventList`.
 
-    silent : bool, default False
-        Do not show a progress bar.
+    bicoherence_norm : {"kim_powers", "sigl_chamoun", "hagihira"}, default "kim_powers"
+        Which normalization to use for the ``bicoherence`` attribute. All lie in
+        ``[0, 1]``. With :math:`T_i = X_i(f_1) X_i(f_2) X_i^{*}(f_1+f_2)`:
 
-    save_all : bool, default False
-        Save all intermediate 2D bispectra used for the final average (under
-        ``bispec_all``). Use with care; the per-segment matrices are large
-        (``m x nf x nf``) and this can fill up RAM.
+        ``"kim_powers"``
+            The **squared** bicoherence of Kim & Powers (1979):
+            :math:`b^2 = |\sum_i T_i|^2 / (\sum_i |X_i(f_1)X_i(f_2)|^2 \sum_i |X_i(f_1+f_2)|^2)`.
+        ``"sigl_chamoun"``
+            Sigl & Chamoun (1994); the unsquared square root of the above.
+        ``"hagihira"``
+            Hagihira (2001) / Hayashi (2007);
+            :math:`b = |\sum_i T_i| / \sum_i |T_i|`.
 
-    save_diagonal : bool, default False
-        Save only the diagonal (``f1 = f2``) of each intermediate bispectrum
-        (under ``bispec_diagonal``, shape ``m x nf``). This is all
-        :meth:`plot_jellyfish` needs, at a fraction of the ``save_all`` memory.
+    poisson_subtract : bool, default False
+        Subtract the Poisson-noise bias per segment (Wirnitzer 1985):
+        :math:`T_i - |X_i(f_1)|^2 - |X_i(f_2)|^2 - |X_i(f_1+f_2)|^2 + 2N_i`.
+        Only appropriate for photon-counting light curves given in counts.
 
     skip_checks : bool, default False
-        Skip initial checks, for speed or other reasons (you need to trust your
-        inputs!).
+        Skip initial checks.
 
     lc : :class:`stingray.Lightcurve`, optional
         For backwards compatibility only. Deprecated; use ``data``.
 
     Attributes
     ----------
-    See :class:`Bispectrum`. In addition:
+    See :class:`CrossBispectrum`. ``nphots1 = nphots2 = nphots3 = nphots``.
+    """
+
+    def __init__(
+        self,
+        data=None,
+        dt=None,
+        gti=None,
+        bicoherence_norm="kim_powers",
+        poisson_subtract=False,
+        skip_checks=False,
+        lc=None,
+    ):
+        self._type = None
+        if lc is not None:
+            warnings.warn("The lc keyword is now deprecated. Use data instead", DeprecationWarning)
+        if data is None:
+            data = lc
+
+        good_input = data is not None
+        if good_input and not skip_checks:
+            good_input = self.initial_checks(data=data, dt=dt)
+
+        self.dt = dt
+        self.gti = gti
+        self.bicoherence_norm = bicoherence_norm
+        self.poisson_subtracted = poisson_subtract
+        self.channels_overlap = True  # the auto case is fully overlapping
+
+        if not good_input:
+            return self._initialize_empty()
+
+        return self._initialize_from_any_input(
+            data,
+            dt=dt,
+            gti=gti,
+            bicoherence_norm=bicoherence_norm,
+            poisson_subtract=poisson_subtract,
+        )
+
+    def initial_checks(self, data=None, dt=None, segment_size=None):
+        """Basic checks on a single (auto) input."""
+        if data is None:
+            return False
+        if isinstance(data, EventList):
+            if dt is None:
+                raise ValueError(
+                    "If the input is an event list, the time resolution dt must be specified."
+                )
+        elif isinstance(data, (Lightcurve, tuple, list, Generator)):
+            pass
+        else:
+            raise TypeError(f"Bad input to Bispectrum: {type(data)}")
+        if segment_size is not None and dt is not None and segment_size < 2 * dt:
+            raise ValueError("segment_size must be at least 2 * dt.")
+        return True
+
+    def _initialize_from_any_input(
+        self,
+        data,
+        dt=None,
+        segment_size=None,
+        gti=None,
+        bicoherence_norm="kim_powers",
+        poisson_subtract=False,
+        silent=False,
+        save_all=False,
+        save_diagonal=False,
+    ):
+        """Initialize from a single input, using the auto-bispectrum path."""
+        kwargs = dict(
+            segment_size=segment_size,
+            gti=gti,
+            bicoherence_norm=bicoherence_norm,
+            poisson_subtract=poisson_subtract,
+            silent=silent,
+            save_all=save_all,
+            save_diagonal=save_diagonal,
+        )
+        if isinstance(data, EventList):
+            spec = bispectrum_from_events(data, dt, **kwargs)
+        elif isinstance(data, Lightcurve):
+            spec = bispectrum_from_lightcurve(data, **kwargs)
+        elif isinstance(data, (tuple, list, Generator)):
+            data = list(data)
+            if len(data) == 0 or not isinstance(data[0], Lightcurve):  # pragma: no cover
+                raise TypeError("Bad inputs to Bispectrum")
+            dt = data[0].dt
+            spec = bispectrum_from_lc_iterable(data, dt, **kwargs)
+        else:  # pragma: no cover
+            raise TypeError(f"Bad inputs to Bispectrum: {type(data)}")
+
+        for key, val in spec.__dict__.items():
+            setattr(self, key, val)
+        return
+
+    @staticmethod
+    def from_lightcurve(
+        lc, gti=None, bicoherence_norm="kim_powers", poisson_subtract=False, silent=False
+    ):
+        """Calculate a :class:`Bispectrum` from a light curve."""
+        return bispectrum_from_lightcurve(
+            lc,
+            gti=gti,
+            bicoherence_norm=bicoherence_norm,
+            poisson_subtract=poisson_subtract,
+            silent=silent,
+        )
+
+    @staticmethod
+    def from_events(
+        events, dt, gti=None, bicoherence_norm="kim_powers", poisson_subtract=False, silent=False
+    ):
+        """Calculate a :class:`Bispectrum` from an event list."""
+        return bispectrum_from_events(
+            events,
+            dt,
+            gti=gti,
+            bicoherence_norm=bicoherence_norm,
+            poisson_subtract=poisson_subtract,
+            silent=silent,
+        )
+
+    @staticmethod
+    def from_time_array(
+        times, dt, gti=None, bicoherence_norm="kim_powers", poisson_subtract=False, silent=False
+    ):
+        """Calculate a :class:`Bispectrum` from an array of event times."""
+        return bispectrum_from_time_array(
+            times,
+            dt,
+            gti=gti,
+            bicoherence_norm=bicoherence_norm,
+            poisson_subtract=poisson_subtract,
+            silent=silent,
+        )
+
+    @staticmethod
+    def from_stingray_timeseries(
+        ts,
+        flux_attr,
+        error_flux_attr=None,
+        gti=None,
+        bicoherence_norm="kim_powers",
+        poisson_subtract=False,
+        silent=False,
+    ):
+        """Calculate a :class:`Bispectrum` from a time series."""
+        return bispectrum_from_stingray_timeseries(
+            ts,
+            flux_attr,
+            error_flux_attr=error_flux_attr,
+            gti=gti,
+            bicoherence_norm=bicoherence_norm,
+            poisson_subtract=poisson_subtract,
+            silent=silent,
+        )
+
+
+class AveragedBispectrum(AveragedCrossBispectrum, Bispectrum):
+    type = "bispectrum"
+
+    r"""Make an averaged (auto-)bispectrum from a light curve or event list.
+
+    The light curve is split into segments of length ``segment_size``, an
+    auto-bispectrum is computed per segment, and the results are averaged (see
+    :class:`Bispectrum`). Averaging is what makes the bicoherence and biphase
+    statistically meaningful.
+
+    Parameters
+    ----------
+    data : :class:`stingray.Lightcurve`, iterable of them, or :class:`stingray.events.EventList`
+        The light curve data to be Fourier-transformed.
 
     segment_size : float
-        The size of each averaged segment.
+        The size, in seconds, of each averaged segment.
 
-    bispec_all : list of numpy.ndarray
-        Only present if ``save_all=True``: the full per-segment 2D bispectra.
-
-    bispec_diagonal : list of numpy.ndarray
-        Only present if ``save_diagonal=True``: the diagonal (``f1 = f2``) of
-        each per-segment bispectrum. Enough for :meth:`plot_jellyfish`.
+    Other Parameters
+    ----------------
+    gti : ``[[gti0_0, gti0_1], ...]``
+        Good time intervals.
+    dt : float
+        The time resolution of the light curve (needed for an :class:`EventList`).
+    silent : bool, default False
+        Do not show a progress bar.
+    save_all : bool, default False
+        Save all intermediate 2D bispectra (under ``bispec_all``, shape
+        ``m x nf x nf``). Large; use with care.
+    save_diagonal : bool, default False
+        Save only the diagonal of each intermediate bispectrum (under
+        ``bispec_diagonal``, shape ``m x nf``). Enough for
+        :meth:`plot_jellyfish`, at a fraction of the ``save_all`` memory.
+    skip_checks : bool, default False
+        Skip initial checks.
+    lc : :class:`stingray.Lightcurve`, optional
+        For backwards compatibility only. Deprecated; use ``data``.
     """
 
     def __init__(
@@ -818,6 +1030,7 @@ class AveragedBispectrum(Bispectrum):
         self.gti = gti
         self.bicoherence_norm = bicoherence_norm
         self.poisson_subtracted = poisson_subtract
+        self.channels_overlap = True
         self.segment_size = segment_size
         self.save_all = save_all
 
@@ -849,7 +1062,7 @@ class AveragedBispectrum(Bispectrum):
     def initial_checks(self, data=None, dt=None, segment_size=None):
         if data is not None and segment_size is None:
             raise ValueError("segment_size must be specified for an AveragedBispectrum.")
-        return super().initial_checks(data=data, dt=dt, segment_size=segment_size)
+        return Bispectrum.initial_checks(self, data=data, dt=dt, segment_size=segment_size)
 
     @staticmethod
     def from_lightcurve(
@@ -977,18 +1190,11 @@ class AveragedBispectrum(Bispectrum):
         )
 
 
-def _create_bispectrum_from_result_table(table, force_averaged=False):
-    """Populate a :class:`Bispectrum` or :class:`AveragedBispectrum` from a
-    result table produced by ``stingray.fourier.avg_bispectrum_from_XX``.
+def _populate_bispectrum_from_result_table(bs, table):
+    """Copy the columns and metadata from a fourier result table onto ``bs``.
+
+    Shared by the auto- and cross-bispectrum allocators.
     """
-    if table is None:  # pragma: no cover
-        raise ValueError("No usable segments were found to compute the bispectrum.")
-
-    if table.meta["m"] > 1 or force_averaged:
-        bs = AveragedBispectrum()
-    else:
-        bs = Bispectrum()
-
     bs.freq = np.asarray(table.meta["freq"])
     bs.bispec = table.meta["bispec"]
     bs.bicoherence = table.meta["bicoherence"]
@@ -1008,7 +1214,19 @@ def _create_bispectrum_from_result_table(table, force_averaged=False):
     bs._bicoh_denom2 = table.meta["bicoh_denom2"]
     bs._bicoh_sum_abs = table.meta["bicoh_sum_abs"]
 
-    for attr in ["n", "m", "dt", "df", "nphots", "segment_size", "gti"]:
+    for attr in [
+        "n",
+        "m",
+        "dt",
+        "df",
+        "nphots",
+        "nphots1",
+        "nphots2",
+        "nphots3",
+        "channels_overlap",
+        "segment_size",
+        "gti",
+    ]:
         if attr in table.meta:
             setattr(bs, attr, table.meta[attr])
 
@@ -1016,9 +1234,25 @@ def _create_bispectrum_from_result_table(table, force_averaged=False):
         bs.bispec_all = table.meta["subbs"]
     if "subbs_diagonal" in table.meta:
         bs.bispec_diagonal = table.meta["subbs_diagonal"]
-
     return bs
 
+
+def _create_bispectrum_from_result_table(table, force_averaged=False):
+    """Allocate a :class:`Bispectrum` / :class:`AveragedBispectrum` from a
+    result table produced by ``stingray.fourier.avg_bispectrum_from_XX``."""
+    if table is None:  # pragma: no cover
+        raise ValueError("No usable segments were found to compute the bispectrum.")
+    cls = AveragedBispectrum if (table.meta["m"] > 1 or force_averaged) else Bispectrum
+    return _populate_bispectrum_from_result_table(cls(), table)
+
+
+def _create_crossbispectrum_from_result_table(table, force_averaged=False):
+    """Allocate a :class:`CrossBispectrum` / :class:`AveragedCrossBispectrum`
+    from a result table produced by ``avg_cross_bispectrum_from_XX``."""
+    if table is None:  # pragma: no cover
+        raise ValueError("No usable segments were found to compute the cross-bispectrum.")
+    cls = AveragedCrossBispectrum if (table.meta["m"] > 1 or force_averaged) else CrossBispectrum
+    return _populate_bispectrum_from_result_table(cls(), table)
 
 def bispectrum_from_time_array(
     times,
@@ -1031,7 +1265,7 @@ def bispectrum_from_time_array(
     save_all=False,
     save_diagonal=False,
 ):
-    """Calculate a bispectrum from an array of event times.
+    """Calculate an auto-bispectrum from an array of event times.
 
     Parameters
     ----------
@@ -1049,13 +1283,12 @@ def bispectrum_from_time_array(
         Good time intervals.
     bicoherence_norm : {"kim_powers", "sigl_chamoun", "hagihira"}, default "kim_powers"
         The bicoherence normalization (see :class:`Bispectrum`).
+    poisson_subtract : bool, default False
+        Subtract the Poisson-noise bias.
     silent : bool, default False
         Silence the progress bars.
-    save_all : bool, default False
-        Save all intermediate 2D bispectra used for the final average.
-    save_diagonal : bool, default False
-        Save only the diagonal of each intermediate bispectrum (enough for a
-        jellyfish plot, far less memory than ``save_all``).
+    save_all, save_diagonal : bool, default False
+        Store per-segment bispectra (full cube / diagonal only).
 
     Returns
     -------
@@ -1089,7 +1322,7 @@ def bispectrum_from_events(
     save_all=False,
     save_diagonal=False,
 ):
-    """Calculate a bispectrum from an event list. See
+    """Calculate an auto-bispectrum from an event list. See
     `bispectrum_from_time_array` for the parameters."""
     if gti is None:
         gti = events.gti
@@ -1117,7 +1350,7 @@ def bispectrum_from_lightcurve(
     save_all=False,
     save_diagonal=False,
 ):
-    """Calculate a bispectrum from a light curve. See
+    """Calculate an auto-bispectrum from a light curve. See
     `bispectrum_from_time_array` for the parameters."""
     force_averaged = segment_size is not None
     silent = silent or (segment_size is None)
@@ -1154,7 +1387,7 @@ def bispectrum_from_stingray_timeseries(
     save_all=False,
     save_diagonal=False,
 ):
-    """Calculate a bispectrum from a time series. See
+    """Calculate an auto-bispectrum from a time series. See
     `bispectrum_from_time_array` for the parameters."""
     force_averaged = segment_size is not None
     silent = silent or (segment_size is None)
@@ -1190,33 +1423,9 @@ def bispectrum_from_lc_iterable(
     save_all=False,
     save_diagonal=False,
 ):
-    """Calculate an average bispectrum from an iterable of light curves.
+    """Calculate an average auto-bispectrum from an iterable of light curves.
 
-    Parameters
-    ----------
-    iter_lc : iterable of :class:`stingray.Lightcurve` or `np.array`
-        Light curves. If arrays, they are used as counts.
-    dt : float
-        The time resolution of the light curves.
-
-    Other Parameters
-    ----------------
-    segment_size : float, default None
-        The length, in seconds, of the light curve segments to average.
-    gti : ``[[gti0_0, gti0_1], ...]``
-        Good time intervals.
-    silent : bool, default False
-        Silence the progress bars.
-    save_all : bool, default False
-        Save all intermediate 2D bispectra used for the final average.
-    save_diagonal : bool, default False
-        Save only the diagonal of each intermediate bispectrum (enough for a
-        jellyfish plot, far less memory than ``save_all``).
-
-    Returns
-    -------
-    spec : :class:`AveragedBispectrum` or :class:`Bispectrum`
-        The output bispectrum.
+    See `bispectrum_from_time_array` for the parameters.
     """
     force_averaged = segment_size is not None
     silent = silent or (segment_size is None)
@@ -1257,3 +1466,241 @@ def bispectrum_from_lc_iterable(
         save_diagonal=save_diagonal,
     )
     return _create_bispectrum_from_result_table(table, force_averaged=force_averaged)
+
+
+# ---------------------------------------------------------------------------
+# Cross-bispectrum module functions
+# ---------------------------------------------------------------------------
+
+
+def crossbispectrum_from_time_array(
+    times1,
+    times2,
+    times3,
+    dt,
+    segment_size=None,
+    gti=None,
+    bicoherence_norm="kim_powers",
+    poisson_subtract=False,
+    channels_overlap=False,
+    silent=False,
+    save_all=False,
+    save_diagonal=False,
+):
+    """Calculate a cross-bispectrum from three arrays of event times.
+
+    The three channels must be simultaneous. See `crossbispectrum_from_lightcurve`
+    and :class:`CrossBispectrum` for the parameters.
+    """
+    force_averaged = segment_size is not None
+    silent = silent or (segment_size is None)
+    table = avg_cross_bispectrum_from_timeseries(
+        times1,
+        times2,
+        times3,
+        gti,
+        segment_size,
+        dt,
+        bicoherence_norm=bicoherence_norm,
+        poisson_subtract=poisson_subtract,
+        channels_overlap=channels_overlap,
+        silent=silent,
+        return_subbs=save_all,
+        save_diagonal=save_diagonal,
+    )
+    return _create_crossbispectrum_from_result_table(table, force_averaged=force_averaged)
+
+
+def crossbispectrum_from_events(
+    events1,
+    events2,
+    events3,
+    dt,
+    segment_size=None,
+    gti=None,
+    bicoherence_norm="kim_powers",
+    poisson_subtract=False,
+    channels_overlap=False,
+    silent=False,
+    save_all=False,
+    save_diagonal=False,
+):
+    """Calculate a cross-bispectrum from three event lists. See
+    `crossbispectrum_from_lightcurve` for the parameters."""
+    if gti is None:
+        gti = cross_two_gtis(cross_two_gtis(events1.gti, events2.gti), events3.gti)
+    dt = events1.suggest_compatible_dt(dt)
+    return crossbispectrum_from_time_array(
+        events1.time,
+        events2.time,
+        events3.time,
+        dt,
+        segment_size=segment_size,
+        gti=gti,
+        bicoherence_norm=bicoherence_norm,
+        poisson_subtract=poisson_subtract,
+        channels_overlap=channels_overlap,
+        silent=silent,
+        save_all=save_all,
+        save_diagonal=save_diagonal,
+    )
+
+
+def crossbispectrum_from_lightcurve(
+    lc1,
+    lc2,
+    lc3,
+    segment_size=None,
+    gti=None,
+    bicoherence_norm="kim_powers",
+    poisson_subtract=False,
+    channels_overlap=False,
+    silent=False,
+    save_all=False,
+    save_diagonal=False,
+):
+    """Calculate a cross-bispectrum from three simultaneous light curves.
+
+    Parameters
+    ----------
+    lc1, lc2, lc3 : :class:`stingray.Lightcurve`
+        The three channels, mapped to ``X(f1)``, ``Y(f2)``, ``Z(f1+f2)``. They
+        must share the same time bins.
+
+    Other Parameters
+    ----------------
+    See :class:`CrossBispectrum` and `bispectrum_from_time_array`.
+
+    Returns
+    -------
+    spec : :class:`AveragedCrossBispectrum` or :class:`CrossBispectrum`
+        The output cross-bispectrum.
+    """
+    force_averaged = segment_size is not None
+    silent = silent or (segment_size is None)
+    if not (
+        lc1.time.size == lc2.time.size == lc3.time.size
+        and np.allclose(lc1.time, lc2.time)
+        and np.allclose(lc1.time, lc3.time)
+    ):
+        raise ValueError("The three light curves must share the same time bins.")
+    if gti is None:
+        gti = cross_two_gtis(cross_two_gtis(lc1.gti, lc2.gti), lc3.gti)
+    table = avg_cross_bispectrum_from_timeseries(
+        lc1.time,
+        lc2.time,
+        lc3.time,
+        gti,
+        segment_size,
+        lc1.dt,
+        bicoherence_norm=bicoherence_norm,
+        poisson_subtract=poisson_subtract,
+        channels_overlap=channels_overlap,
+        silent=silent,
+        fluxes1=lc1.counts,
+        fluxes2=lc2.counts,
+        fluxes3=lc3.counts,
+        return_subbs=save_all,
+        save_diagonal=save_diagonal,
+    )
+    return _create_crossbispectrum_from_result_table(table, force_averaged=force_averaged)
+
+
+def crossbispectrum_from_stingray_timeseries(
+    ts1,
+    ts2,
+    ts3,
+    flux_attr,
+    error_flux_attr=None,
+    segment_size=None,
+    gti=None,
+    bicoherence_norm="kim_powers",
+    poisson_subtract=False,
+    channels_overlap=False,
+    silent=False,
+    save_all=False,
+    save_diagonal=False,
+):
+    """Calculate a cross-bispectrum from three time series. See
+    `crossbispectrum_from_lightcurve` for the parameters."""
+    force_averaged = segment_size is not None
+    silent = silent or (segment_size is None)
+    if gti is None:
+        gti = cross_two_gtis(cross_two_gtis(ts1.gti, ts2.gti), ts3.gti)
+    table = avg_cross_bispectrum_from_timeseries(
+        ts1.time,
+        ts2.time,
+        ts3.time,
+        gti,
+        segment_size,
+        ts1.dt,
+        bicoherence_norm=bicoherence_norm,
+        poisson_subtract=poisson_subtract,
+        channels_overlap=channels_overlap,
+        silent=silent,
+        fluxes1=getattr(ts1, flux_attr),
+        fluxes2=getattr(ts2, flux_attr),
+        fluxes3=getattr(ts3, flux_attr),
+        return_subbs=save_all,
+        save_diagonal=save_diagonal,
+    )
+    return _create_crossbispectrum_from_result_table(table, force_averaged=force_averaged)
+
+
+def crossbispectrum_from_lc_iterable(
+    iter_lc1,
+    iter_lc2,
+    iter_lc3,
+    dt,
+    segment_size=None,
+    gti=None,
+    bicoherence_norm="kim_powers",
+    poisson_subtract=False,
+    channels_overlap=False,
+    silent=False,
+    save_all=False,
+    save_diagonal=False,
+):
+    """Calculate an average cross-bispectrum from three iterables of light curves.
+
+    See `crossbispectrum_from_lightcurve` for the parameters.
+    """
+    force_averaged = segment_size is not None
+    silent = silent or (segment_size is None)
+    common_gti = gti
+
+    def iterate_lc_counts(iter_lc):
+        for lc in iter_lc:
+            if hasattr(lc, "counts"):
+                n_bin = (
+                    np.rint(segment_size / lc.dt).astype(int) if segment_size else lc.counts.size
+                )
+                lc_gti = lc.gti
+                if common_gti is not None:
+                    lc_gti = cross_two_gtis(common_gti, lc.gti)
+                flux_iterable = get_flux_iterable_from_segments(
+                    lc.time, lc_gti, segment_size, n_bin, fluxes=lc.counts
+                )
+                for out in flux_iterable:
+                    yield out
+            elif isinstance(lc, Iterable):
+                yield lc
+            else:
+                raise TypeError(
+                    "The inputs to crossbispectrum_from_lc_iterable must be "
+                    "Lightcurve objects or arrays."
+                )
+
+    table = avg_cross_bispectrum_from_iterables(
+        iterate_lc_counts(iter_lc1),
+        iterate_lc_counts(iter_lc2),
+        iterate_lc_counts(iter_lc3),
+        dt,
+        bicoherence_norm=bicoherence_norm,
+        poisson_subtract=poisson_subtract,
+        channels_overlap=channels_overlap,
+        silent=silent,
+        return_subbs=save_all,
+        save_diagonal=save_diagonal,
+    )
+    return _create_crossbispectrum_from_result_table(table, force_averaged=force_averaged)
