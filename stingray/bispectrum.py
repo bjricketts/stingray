@@ -63,7 +63,7 @@ class CrossBispectrum(StingrayObject):
 
     Parameters
     ----------
-    data1, data2, data3 : :class:`stingray.Lightcurve` or :class:`stingray.events.EventList`, optional
+    data1, data2, data3 : :class:`stingray.Lightcurve` or :class:`stingray.EventList`, optional
         The three channels, mapped to the factors ``X(f1)``, ``Y(f2)`` and
         ``Z(f1+f2)`` respectively. ``data2`` and ``data3`` default to ``data1``
         (recovering the auto-bispectrum). All three must be simultaneous (same
@@ -609,7 +609,7 @@ class AveragedCrossBispectrum(CrossBispectrum):
 
     Parameters
     ----------
-    data1, data2, data3 : :class:`stingray.Lightcurve`, iterable of them, or :class:`stingray.events.EventList`
+    data1, data2, data3 : :class:`stingray.Lightcurve`, iterable, or :class:`stingray.EventList`
         The three channels. ``data2``/``data3`` default to ``data1``.
 
     segment_size : float
@@ -1503,6 +1503,8 @@ class DynamicalCrossBispectrum(AveragedCrossBispectrum):
             valid=valid,
         )
 
+    # -- helpers -----------------------------------------------------------
+
     def _diagonal(self, arr):
         """Return the ``(n_time, nf)`` diagonal of a per-bin quantity."""
         if self.store == "diagonal":
@@ -1511,6 +1513,8 @@ class DynamicalCrossBispectrum(AveragedCrossBispectrum):
 
     def _freq_index(self, f):
         return int(np.argmin(np.abs(self.freq - f)))
+
+    # -- plotting ----------------------------------------------------------
 
     def plot_diagonal(self, ax=None, cmap="viridis", vmin=0.0, vmax=1.0, colorbar=True):
         r"""Plot the diagonal dynamical bicoherence ``b(nu, nu, t)``.
@@ -1666,6 +1670,8 @@ class DynamicalCrossBispectrum(AveragedCrossBispectrum):
         ax1.set_ylim(-190, 190)
         return axes
 
+    # -- rebinning ---------------------------------------------------------
+
     def _rebinned_by_n_time(self, n):
         """Return a copy with consecutive time bins summed in groups of ``n``."""
         import copy as _copy
@@ -1755,6 +1761,8 @@ class DynamicalCrossBispectrum(AveragedCrossBispectrum):
         new.df = self.df * n
         new._recompute()
         return new
+
+    # -- tracking ----------------------------------------------------------
 
     def trace_maximum(self, min_freq=None, max_freq=None):
         """Trace the peak-bicoherence diagonal frequency index in each time bin.
@@ -1966,6 +1974,12 @@ def _create_crossbispectrum_from_result_table(table, force_averaged=False):
         raise ValueError("No usable segments were found to compute the cross-bispectrum.")
     cls = AveragedCrossBispectrum if (table.meta["m"] > 1 or force_averaged) else CrossBispectrum
     return _populate_bispectrum_from_result_table(cls(), table)
+
+
+# ---------------------------------------------------------------------------
+# Auto-bispectrum module functions
+# ---------------------------------------------------------------------------
+
 
 def bispectrum_from_time_array(
     times,
@@ -2179,6 +2193,11 @@ def bispectrum_from_lc_iterable(
         save_diagonal=save_diagonal,
     )
     return _create_bispectrum_from_result_table(table, force_averaged=force_averaged)
+
+
+# ---------------------------------------------------------------------------
+# Cross-bispectrum module functions
+# ---------------------------------------------------------------------------
 
 
 def crossbispectrum_from_time_array(

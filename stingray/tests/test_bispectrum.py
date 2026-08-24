@@ -19,7 +19,6 @@ from stingray.fourier import (
     positive_fft_bins,
     avg_bispectrum_from_iterable,
     avg_bispectrum_from_timeseries,
-    avg_cross_bispectrum_from_iterables,
     bicoherence_from_sums,
     BICOHERENCE_NORMS,
     _bispectrum_frequency_grid,
