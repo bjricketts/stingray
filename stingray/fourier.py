@@ -3132,7 +3132,12 @@ def bicoherence_from_sums(norm, abs_bispec_sum, denom1, denom2, sum_abs_triple, 
 
 
 def avg_bispectrum_from_iterable(
-    flux_iterable, dt, bicoherence_norm="kim_powers", silent=False, return_subbs=False
+    flux_iterable,
+    dt,
+    bicoherence_norm="kim_powers",
+    poisson_subtract=False,
+    silent=False,
+    return_subbs=False,
 ):
     """Bispectrum, bicoherence and biphase from an iterable of segments.
 
@@ -3167,6 +3172,18 @@ def avg_bispectrum_from_iterable(
 
     Other Parameters
     ----------------
+    poisson_subtract : bool, default False
+        If True, subtract the Poisson-noise bias from each per-segment
+        bispectrum before averaging, using the correction of Wirnitzer (1985)
+        (see Nathan et al. 2022; Maccarone 2013),
+
+        .. math::
+
+            B_i(f_1, f_2) \\rightarrow X_i(f_1) X_i(f_2) X_i^{*}(f_1+f_2)
+            - |X_i(f_1)|^2 - |X_i(f_2)|^2 - |X_i(f_1+f_2)|^2 + 2 N_i,
+
+        where :math:`N_i` is the number of photons in the segment. Only
+        appropriate for photon-counting (Poisson) light curves in counts.
     silent : bool, default False
         Silence the progress bar.
     return_subbs : bool, default False
@@ -3223,7 +3240,8 @@ def avg_bispectrum_from_iterable(
             freq, idx1, idx2, idx3, valid = _bispectrum_frequency_grid(n_bin, dt)
 
         ft = fft(flux)
-        sum_of_photons += flux.sum()
+        n_ph_seg = flux.sum()
+        sum_of_photons += n_ph_seg
 
         x1 = ft[idx1]
         x2 = ft[idx2]
@@ -3231,6 +3249,13 @@ def avg_bispectrum_from_iterable(
         triple = x1 * x2 * np.conj(x3)
         denom1 = (x1 * x2).real ** 2 + (x1 * x2).imag ** 2
         denom2 = x3.real**2 + x3.imag**2
+
+        if poisson_subtract:
+            # Wirnitzer (1985) photon-noise bias: subtract the individual power
+            # terms and add back twice the photon count. denom2 is |X(f1+f2)|^2.
+            p1 = x1.real**2 + x1.imag**2
+            p2 = x2.real**2 + x2.imag**2
+            triple = triple - (p1 + p2 + denom2 - 2.0 * n_ph_seg)
 
         bispec_sum = sum_if_not_none_or_initialize(bispec_sum, triple)
         denom1_sum = sum_if_not_none_or_initialize(denom1_sum, denom1)
@@ -3298,6 +3323,7 @@ def avg_bispectrum_from_iterable(
             "bispec": bispec,
             "bicoherence": bicoherence,
             "bicoherence_norm": bicoherence_norm,
+            "poisson_subtract": poisson_subtract,
             "biphase": biphase,
             "bispec_err": bispec_err,
             "biphase_err": biphase_err,
@@ -3327,6 +3353,7 @@ def avg_bispectrum_from_timeseries(
     segment_size,
     dt,
     bicoherence_norm="kim_powers",
+    poisson_subtract=False,
     silent=False,
     fluxes=None,
     errors=None,
@@ -3352,6 +3379,9 @@ def avg_bispectrum_from_timeseries(
 
     Other Parameters
     ----------------
+    poisson_subtract : bool, default False
+        Subtract the Poisson-noise bias (Wirnitzer 1985). See
+        `avg_bispectrum_from_iterable`.
     silent : bool, default False
         Silence the progress bar.
     fluxes : float `np.array`, default None
@@ -3384,6 +3414,7 @@ def avg_bispectrum_from_timeseries(
         flux_iterable,
         dt,
         bicoherence_norm=bicoherence_norm,
+        poisson_subtract=poisson_subtract,
         silent=silent,
         return_subbs=return_subbs,
     )

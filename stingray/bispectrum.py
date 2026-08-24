@@ -78,6 +78,16 @@ class Bispectrum(StingrayObject):
         Any of these can be recomputed after the fact with
         :meth:`recompute_bicoherence` (no FFTs are redone).
 
+    poisson_subtract : bool, default False
+        If True, subtract the Poisson-noise bias from each segment before
+        averaging, following Wirnitzer (1985) (see Nathan et al. 2022;
+        Maccarone 2013):
+        :math:`X(f_1) X(f_2) X^{*}(f_1+f_2) - |X(f_1)|^2 - |X(f_2)|^2 - |X(f_1+f_2)|^2 + 2N`,
+        with :math:`N` the photon count in the segment. Poisson noise biases the
+        real part of the bispectrum (and hence the biphase), so this is
+        recommended for photon-counting light curves given in counts. Only
+        appropriate for Poisson data.
+
     skip_checks : bool, default False
         Skip initial checks, for speed or other reasons (you need to trust your
         inputs!).
@@ -106,6 +116,9 @@ class Bispectrum(StingrayObject):
 
     bicoherence_norm : str
         The normalization used for ``bicoherence``.
+
+    poisson_subtracted : bool
+        Whether the Poisson-noise bias was subtracted.
 
     biphase : numpy.ndarray
         The phase of the bispectrum, an ``nf x nf`` matrix defined over the
@@ -161,6 +174,7 @@ class Bispectrum(StingrayObject):
         dt=None,
         gti=None,
         bicoherence_norm="kim_powers",
+        poisson_subtract=False,
         skip_checks=False,
         lc=None,
     ):
@@ -177,12 +191,17 @@ class Bispectrum(StingrayObject):
         self.dt = dt
         self.gti = gti
         self.bicoherence_norm = bicoherence_norm
+        self.poisson_subtracted = poisson_subtract
 
         if not good_input:
             return self._initialize_empty()
 
         return self._initialize_from_any_input(
-            data, dt=dt, gti=gti, bicoherence_norm=bicoherence_norm
+            data,
+            dt=dt,
+            gti=gti,
+            bicoherence_norm=bicoherence_norm,
+            poisson_subtract=poisson_subtract,
         )
 
     def initial_checks(self, data=None, dt=None, segment_size=None):
@@ -219,6 +238,7 @@ class Bispectrum(StingrayObject):
         segment_size=None,
         gti=None,
         bicoherence_norm="kim_powers",
+        poisson_subtract=False,
         silent=False,
         save_all=False,
     ):
@@ -230,6 +250,7 @@ class Bispectrum(StingrayObject):
                 segment_size=segment_size,
                 gti=gti,
                 bicoherence_norm=bicoherence_norm,
+                poisson_subtract=poisson_subtract,
                 silent=silent,
                 save_all=save_all,
             )
@@ -239,6 +260,7 @@ class Bispectrum(StingrayObject):
                 segment_size=segment_size,
                 gti=gti,
                 bicoherence_norm=bicoherence_norm,
+                poisson_subtract=poisson_subtract,
                 silent=silent,
                 save_all=save_all,
             )
@@ -253,6 +275,7 @@ class Bispectrum(StingrayObject):
                 segment_size=segment_size,
                 gti=gti,
                 bicoherence_norm=bicoherence_norm,
+                poisson_subtract=poisson_subtract,
                 silent=silent,
                 save_all=save_all,
             )
@@ -269,6 +292,7 @@ class Bispectrum(StingrayObject):
         self.bispec = None
         self.bicoherence = None
         self.bicoherence_norm = getattr(self, "bicoherence_norm", "kim_powers")
+        self.poisson_subtracted = getattr(self, "poisson_subtracted", False)
         self.biphase = None
         self.bispec_mag = None
         self.bispec_phase = None
@@ -328,7 +352,9 @@ class Bispectrum(StingrayObject):
         return bicoh
 
     @staticmethod
-    def from_lightcurve(lc, gti=None, bicoherence_norm="kim_powers", silent=False):
+    def from_lightcurve(
+        lc, gti=None, bicoherence_norm="kim_powers", poisson_subtract=False, silent=False
+    ):
         """Calculate a :class:`Bispectrum` from a light curve.
 
         Parameters
@@ -346,11 +372,17 @@ class Bispectrum(StingrayObject):
             Silence the progress bars.
         """
         return bispectrum_from_lightcurve(
-            lc, gti=gti, bicoherence_norm=bicoherence_norm, silent=silent
+            lc,
+            gti=gti,
+            bicoherence_norm=bicoherence_norm,
+            poisson_subtract=poisson_subtract,
+            silent=silent,
         )
 
     @staticmethod
-    def from_events(events, dt, gti=None, bicoherence_norm="kim_powers", silent=False):
+    def from_events(
+        events, dt, gti=None, bicoherence_norm="kim_powers", poisson_subtract=False, silent=False
+    ):
         """Calculate a :class:`Bispectrum` from an event list.
 
         Parameters
@@ -371,11 +403,18 @@ class Bispectrum(StingrayObject):
             Silence the progress bars.
         """
         return bispectrum_from_events(
-            events, dt, gti=gti, bicoherence_norm=bicoherence_norm, silent=silent
+            events,
+            dt,
+            gti=gti,
+            bicoherence_norm=bicoherence_norm,
+            poisson_subtract=poisson_subtract,
+            silent=silent,
         )
 
     @staticmethod
-    def from_time_array(times, dt, gti=None, bicoherence_norm="kim_powers", silent=False):
+    def from_time_array(
+        times, dt, gti=None, bicoherence_norm="kim_powers", poisson_subtract=False, silent=False
+    ):
         """Calculate a :class:`Bispectrum` from an array of event times.
 
         Parameters
@@ -395,12 +434,23 @@ class Bispectrum(StingrayObject):
             Silence the progress bars.
         """
         return bispectrum_from_time_array(
-            times, dt, gti=gti, bicoherence_norm=bicoherence_norm, silent=silent
+            times,
+            dt,
+            gti=gti,
+            bicoherence_norm=bicoherence_norm,
+            poisson_subtract=poisson_subtract,
+            silent=silent,
         )
 
     @staticmethod
     def from_stingray_timeseries(
-        ts, flux_attr, error_flux_attr=None, gti=None, bicoherence_norm="kim_powers", silent=False
+        ts,
+        flux_attr,
+        error_flux_attr=None,
+        gti=None,
+        bicoherence_norm="kim_powers",
+        poisson_subtract=False,
+        silent=False,
     ):
         """Calculate a :class:`Bispectrum` from a time series.
 
@@ -428,6 +478,7 @@ class Bispectrum(StingrayObject):
             error_flux_attr=error_flux_attr,
             gti=gti,
             bicoherence_norm=bicoherence_norm,
+            poisson_subtract=poisson_subtract,
             silent=silent,
         )
 
@@ -723,6 +774,7 @@ class AveragedBispectrum(Bispectrum):
         gti=None,
         dt=None,
         bicoherence_norm="kim_powers",
+        poisson_subtract=False,
         silent=False,
         save_all=False,
         skip_checks=False,
@@ -741,6 +793,7 @@ class AveragedBispectrum(Bispectrum):
         self.dt = dt
         self.gti = gti
         self.bicoherence_norm = bicoherence_norm
+        self.poisson_subtracted = poisson_subtract
         self.segment_size = segment_size
         self.save_all = save_all
 
@@ -763,6 +816,7 @@ class AveragedBispectrum(Bispectrum):
             segment_size=segment_size,
             gti=gti,
             bicoherence_norm=bicoherence_norm,
+            poisson_subtract=poisson_subtract,
             silent=silent,
             save_all=save_all,
         )
@@ -774,7 +828,13 @@ class AveragedBispectrum(Bispectrum):
 
     @staticmethod
     def from_lightcurve(
-        lc, segment_size, gti=None, bicoherence_norm="kim_powers", silent=False, save_all=False
+        lc,
+        segment_size,
+        gti=None,
+        bicoherence_norm="kim_powers",
+        poisson_subtract=False,
+        silent=False,
+        save_all=False,
     ):
         """Calculate an :class:`AveragedBispectrum` from a light curve."""
         return bispectrum_from_lightcurve(
@@ -782,6 +842,7 @@ class AveragedBispectrum(Bispectrum):
             segment_size=segment_size,
             gti=gti,
             bicoherence_norm=bicoherence_norm,
+            poisson_subtract=poisson_subtract,
             silent=silent,
             save_all=save_all,
         )
@@ -793,6 +854,7 @@ class AveragedBispectrum(Bispectrum):
         segment_size,
         gti=None,
         bicoherence_norm="kim_powers",
+        poisson_subtract=False,
         silent=False,
         save_all=False,
     ):
@@ -803,6 +865,7 @@ class AveragedBispectrum(Bispectrum):
             segment_size=segment_size,
             gti=gti,
             bicoherence_norm=bicoherence_norm,
+            poisson_subtract=poisson_subtract,
             silent=silent,
             save_all=save_all,
         )
@@ -814,6 +877,7 @@ class AveragedBispectrum(Bispectrum):
         segment_size,
         gti=None,
         bicoherence_norm="kim_powers",
+        poisson_subtract=False,
         silent=False,
         save_all=False,
     ):
@@ -824,6 +888,7 @@ class AveragedBispectrum(Bispectrum):
             segment_size=segment_size,
             gti=gti,
             bicoherence_norm=bicoherence_norm,
+            poisson_subtract=poisson_subtract,
             silent=silent,
             save_all=save_all,
         )
@@ -836,6 +901,7 @@ class AveragedBispectrum(Bispectrum):
         error_flux_attr=None,
         gti=None,
         bicoherence_norm="kim_powers",
+        poisson_subtract=False,
         silent=False,
         save_all=False,
     ):
@@ -847,6 +913,7 @@ class AveragedBispectrum(Bispectrum):
             segment_size=segment_size,
             gti=gti,
             bicoherence_norm=bicoherence_norm,
+            poisson_subtract=poisson_subtract,
             silent=silent,
             save_all=save_all,
         )
@@ -858,6 +925,7 @@ class AveragedBispectrum(Bispectrum):
         segment_size,
         gti=None,
         bicoherence_norm="kim_powers",
+        poisson_subtract=False,
         silent=False,
         save_all=False,
     ):
@@ -868,6 +936,7 @@ class AveragedBispectrum(Bispectrum):
             segment_size=segment_size,
             gti=gti,
             bicoherence_norm=bicoherence_norm,
+            poisson_subtract=poisson_subtract,
             silent=silent,
             save_all=save_all,
         )
@@ -889,6 +958,7 @@ def _create_bispectrum_from_result_table(table, force_averaged=False):
     bs.bispec = table.meta["bispec"]
     bs.bicoherence = table.meta["bicoherence"]
     bs.bicoherence_norm = table.meta["bicoherence_norm"]
+    bs.poisson_subtracted = table.meta.get("poisson_subtract", False)
     bs.biphase = table.meta["biphase"]
     bs.bispec_err = table.meta["bispec_err"]
     bs.biphase_err = table.meta["biphase_err"]
@@ -919,6 +989,7 @@ def bispectrum_from_time_array(
     segment_size=None,
     gti=None,
     bicoherence_norm="kim_powers",
+    poisson_subtract=False,
     silent=False,
     save_all=False,
 ):
@@ -958,6 +1029,7 @@ def bispectrum_from_time_array(
         segment_size,
         dt,
         bicoherence_norm=bicoherence_norm,
+        poisson_subtract=poisson_subtract,
         silent=silent,
         return_subbs=save_all,
     )
@@ -970,6 +1042,7 @@ def bispectrum_from_events(
     segment_size=None,
     gti=None,
     bicoherence_norm="kim_powers",
+    poisson_subtract=False,
     silent=False,
     save_all=False,
 ):
@@ -984,13 +1057,20 @@ def bispectrum_from_events(
         segment_size=segment_size,
         gti=gti,
         bicoherence_norm=bicoherence_norm,
+        poisson_subtract=poisson_subtract,
         silent=silent,
         save_all=save_all,
     )
 
 
 def bispectrum_from_lightcurve(
-    lc, segment_size=None, gti=None, bicoherence_norm="kim_powers", silent=False, save_all=False
+    lc,
+    segment_size=None,
+    gti=None,
+    bicoherence_norm="kim_powers",
+    poisson_subtract=False,
+    silent=False,
+    save_all=False,
 ):
     """Calculate a bispectrum from a light curve. See
     `bispectrum_from_time_array` for the parameters."""
@@ -1007,6 +1087,7 @@ def bispectrum_from_lightcurve(
         segment_size,
         lc.dt,
         bicoherence_norm=bicoherence_norm,
+        poisson_subtract=poisson_subtract,
         silent=silent,
         fluxes=lc.counts,
         errors=err,
@@ -1022,6 +1103,7 @@ def bispectrum_from_stingray_timeseries(
     segment_size=None,
     gti=None,
     bicoherence_norm="kim_powers",
+    poisson_subtract=False,
     silent=False,
     save_all=False,
 ):
@@ -1040,6 +1122,7 @@ def bispectrum_from_stingray_timeseries(
         segment_size,
         ts.dt,
         bicoherence_norm=bicoherence_norm,
+        poisson_subtract=poisson_subtract,
         silent=silent,
         fluxes=getattr(ts, flux_attr),
         errors=err,
@@ -1054,6 +1137,7 @@ def bispectrum_from_lc_iterable(
     segment_size=None,
     gti=None,
     bicoherence_norm="kim_powers",
+    poisson_subtract=False,
     silent=False,
     save_all=False,
 ):
@@ -1115,6 +1199,7 @@ def bispectrum_from_lc_iterable(
         iterate_lc_counts(iter_lc),
         dt,
         bicoherence_norm=bicoherence_norm,
+        poisson_subtract=poisson_subtract,
         silent=silent,
         return_subbs=save_all,
     )
