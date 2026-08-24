@@ -8,7 +8,7 @@ from stingray.base import StingrayObject
 
 from .events import EventList
 from .lightcurve import Lightcurve
-from .gti import cross_two_gtis
+from .gti import cross_two_gtis, time_intervals_from_gtis
 from .fourier import (
     avg_bispectrum_from_iterable,
     avg_bispectrum_from_timeseries,
@@ -23,6 +23,8 @@ __all__ = [
     "AveragedCrossBispectrum",
     "Bispectrum",
     "AveragedBispectrum",
+    "DynamicalCrossBispectrum",
+    "DynamicalBispectrum",
 ]
 
 
@@ -1190,6 +1192,715 @@ class AveragedBispectrum(AveragedCrossBispectrum, Bispectrum):
         )
 
 
+def _pixel_edges(x):
+    """Bin edges for ``pcolormesh`` from (possibly non-uniform) bin centers."""
+    x = np.asarray(x, dtype=float)
+    if x.size == 1:
+        return np.array([x[0] - 0.5, x[0] + 0.5])
+    mid = 0.5 * (x[1:] + x[:-1])
+    first = x[0] - (mid[0] - x[0])
+    last = x[-1] + (x[-1] - mid[-1])
+    return np.concatenate([[first], mid, [last]])
+
+
+class DynamicalCrossBispectrum(AveragedCrossBispectrum):
+    type = "crossbispectrum"
+
+    r"""Make a time-resolved (dynamical) cross-bispectrum.
+
+    This is the higher-order analogue of :class:`stingray.DynamicalCrossspectrum`.
+    The observation is divided into time bins of length ``bin_size``; within each
+    bin an :class:`AveragedCrossBispectrum` is computed over segments of length
+    ``segment_size``, and the results are stacked as a function of both time and
+    frequency. It traces how quadratic phase coupling between channels evolves.
+
+    Unlike the dynamical *power* spectrum, the time unit is a **block of several
+    segments**, not a single segment: a bicoherence built from one segment is
+    identically 1 and carries no information, so it only becomes meaningful once
+    several segments are averaged. Hence the two time scales ``segment_size``
+    (the FFT length, which sets ``df`` and the Nyquist frequency) and ``bin_size``
+    (the length of each dynamical row); the time resolution is ``bin_size``.
+
+    Because each time bin holds a full 2-D ``(f1, f2)`` map, the stored object is
+    a 3-D cube. That is expensive, so by default only the **diagonal**
+    ``f1 = f2 = nu`` is kept (``store="diagonal"``), giving a ``nu x time`` image
+    directly analogous to ``dyn_ps``; pass ``store="full"`` to keep the whole
+    cube (needed for :meth:`plot_slice`, :meth:`plot_frame`, :meth:`plot_montage`).
+
+    Parameters
+    ----------
+    data1, data2, data3 : :class:`stingray.Lightcurve` or :class:`stingray.events.EventList`
+        The three channels, mapped to ``X(f1)``, ``Y(f2)``, ``Z(f1+f2)``.
+        ``data2``/``data3`` default to ``data1`` (the auto case). For event
+        lists, ``sample_time`` must be given.
+    segment_size : float
+        Length, in seconds, of the FFT segments averaged inside each time bin.
+    bin_size : float
+        Length, in seconds, of each dynamical time bin. Must be at least
+        ``segment_size``; ``bin_size / segment_size`` segments are averaged per
+        bin, and a warning is issued if that is small (the bicoherence bias
+        floor is ``~1/sqrt(m)``).
+
+    Other Parameters
+    ----------------
+    bicoherence_norm : {"kim_powers", "sigl_chamoun", "hagihira"}, default "kim_powers"
+        Bicoherence normalization (see :class:`Bispectrum`).
+    poisson_subtract : bool, default False
+        Subtract the per-bin Poisson-noise bias. For the cross case only has an
+        effect when ``channels_overlap`` is True. Note the bias scales as
+        ``~1/sqrt(N_bin)`` and a bin holds fewer photons than the whole
+        observation, so the correction matters more per row than for a static
+        bispectrum.
+    channels_overlap : bool, default False
+        Whether the three channels share the same photons.
+    store : {"diagonal", "full"}, default "diagonal"
+        Whether to keep only the diagonal of each time bin (light) or the whole
+        ``(f1, f2)`` map (heavy).
+    gti : ``[[gti0_0, gti0_1], ...]``
+        Good time intervals. Defaults to the intersection of the inputs' GTIs.
+    sample_time : float
+        Time resolution of the light curves created from event lists. Required
+        for :class:`EventList` inputs.
+
+    Attributes
+    ----------
+    freq : numpy.ndarray
+        The frequency axis (signed for the cross case, positive for the auto
+        case).
+    time : numpy.ndarray
+        Mid-point time of each dynamical bin.
+    dyn_bicoherence : numpy.ndarray
+        The bicoherence per time bin: ``(n_time, nf)`` if ``store="diagonal"``,
+        else ``(n_time, nf, nf)``.
+    dyn_bispec : numpy.ndarray
+        The complex cross-bispectrum per time bin, same shape as
+        ``dyn_bicoherence``.
+    dyn_biphase : numpy.ndarray
+        The biphase per time bin, same shape.
+    valid : numpy.ndarray
+        ``(nf, nf)`` boolean mask of the resolved region.
+    valid_diag : numpy.ndarray
+        ``(nf,)`` boolean mask of the resolved diagonal frequencies.
+    df, dt : float
+        Frequency resolution, and time resolution (``= bin_size``).
+    m : int
+        Number of segments averaged per time bin.
+    nseg : numpy.ndarray
+        Number of segments actually averaged in each bin.
+    """
+
+    def __init__(
+        self,
+        data1=None,
+        data2=None,
+        data3=None,
+        segment_size=None,
+        bin_size=None,
+        bicoherence_norm="kim_powers",
+        poisson_subtract=False,
+        channels_overlap=False,
+        store="diagonal",
+        gti=None,
+        sample_time=None,
+        skip_checks=False,
+    ):
+        self._type = None
+        self.segment_size = segment_size
+        self.bin_size = bin_size
+        self.sample_time = sample_time
+        self.gti = gti
+        self.bicoherence_norm = bicoherence_norm
+        self.poisson_subtract = poisson_subtract
+        self.channels_overlap = channels_overlap
+        self.poisson_subtracted = poisson_subtract and channels_overlap
+        if store not in ("diagonal", "full"):
+            raise ValueError("store must be 'diagonal' or 'full'")
+        self.store = store
+
+        if data1 is not None:
+            if data2 is None:
+                data2 = data1
+            if data3 is None:
+                data3 = data1
+
+        if segment_size is None and bin_size is None and data1 is None:
+            return self._initialize_empty()
+
+        if not skip_checks:
+            self._dyn_checks(data1, data2, data3, sample_time, segment_size, bin_size)
+
+        self._make_matrix(data1, data2, data3)
+
+    def _initialize_empty(self):
+        self.freq = None
+        self.time = None
+        self.valid = None
+        self.valid_diag = None
+        self.dyn_bispec = None
+        self.dyn_bicoherence = None
+        self.dyn_biphase = None
+        self.nseg = None
+        self.nphots = None
+        self.nphots1 = None
+        self.nphots2 = None
+        self.nphots3 = None
+        self.df = None
+        self.dt = None
+        self.m = None
+        self._sum_bispec = None
+        self._sum_denom1 = None
+        self._sum_denom2 = None
+        self._sum_absT = None
+        return
+
+    def _dyn_checks(self, data1, data2, data3, sample_time, segment_size, bin_size):
+        if data1 is None:
+            raise TypeError("data1 must be specified")
+        if segment_size is None or bin_size is None:
+            raise TypeError("segment_size and bin_size must both be specified")
+        for data in (data1, data2, data3):
+            if isinstance(data, EventList) and sample_time is None:
+                raise ValueError("To pass event lists, please specify sample_time")
+        if not (isinstance(data1, type(data2)) and isinstance(data1, type(data3))):
+            raise ValueError("The input channels must all be of the same kind.")
+        st = data1.dt if isinstance(data1, Lightcurve) else sample_time
+        if segment_size < 2 * st:
+            raise ValueError("segment_size must be at least 2 * sample_time.")
+        if bin_size < segment_size:
+            raise ValueError("bin_size must be at least as long as segment_size.")
+        n_per_bin = int(round(bin_size / segment_size))
+        if n_per_bin < 10:
+            warnings.warn(
+                f"Only ~{n_per_bin} segment(s) per time bin: the bicoherence bias "
+                "floor (~1/sqrt(m)) will be large. Consider a larger bin_size."
+            )
+        return True
+
+    def _build_bin(self, data1, data2, data3, bin_gti):
+        """Build the averaged cross-bispectrum for one time bin."""
+        return AveragedCrossBispectrum(
+            data1,
+            data2,
+            data3,
+            segment_size=self.segment_size,
+            gti=bin_gti,
+            dt=self.sample_time,
+            bicoherence_norm=self.bicoherence_norm,
+            poisson_subtract=self.poisson_subtract,
+            channels_overlap=self.channels_overlap,
+            silent=True,
+        )
+
+    def _resolve_gti(self, data1, data2, data3):
+        if self.gti is not None:
+            return np.asarray(self.gti)
+        gti = data1.gti
+        for data in (data2, data3):
+            gti = cross_two_gtis(gti, data.gti)
+        return np.asarray(gti)
+
+    @staticmethod
+    def _bin_nphots(avg):
+        n = getattr(avg, "nphots", None)
+        n1 = getattr(avg, "nphots1", None)
+        n2 = getattr(avg, "nphots2", None)
+        n3 = getattr(avg, "nphots3", None)
+        n1 = n if n1 is None else n1
+        n2 = n if n2 is None else n2
+        n3 = n if n3 is None else n3
+        return n, n1, n2, n3
+
+    def _make_matrix(self, data1, data2, data3):
+        """Fill the dynamical cube, iterating over time bins."""
+        gti = self._resolve_gti(data1, data2, data3)
+        tstart, tstop = time_intervals_from_gtis(gti, self.bin_size)
+
+        diag = self.store == "diagonal"
+        sum_bispec, sum_d1, sum_d2, sum_absT = [], [], [], []
+        times, nseg, nph, nph1, nph2, nph3 = [], [], [], [], [], []
+        freq = valid = None
+        n_skipped = 0
+
+        for ts, te in zip(tstart, tstop):
+            bin_gti = cross_two_gtis(gti, np.array([[ts, te]]))
+            try:
+                avg = self._build_bin(data1, data2, data3, bin_gti)
+            except ValueError:
+                n_skipped += 1
+                continue
+            if getattr(avg, "freq", None) is None:
+                n_skipped += 1
+                continue
+
+            if freq is None:
+                freq = avg.freq
+                valid = avg.valid
+
+            triple_sum = avg.bispec * avg.m  # complex sum of the per-segment triples
+            d1, d2, aT = avg._bicoh_denom1, avg._bicoh_denom2, avg._bicoh_sum_abs
+            if diag:
+                sum_bispec.append(np.diag(triple_sum).copy())
+                sum_d1.append(np.diag(d1).copy())
+                sum_d2.append(np.diag(d2).copy())
+                sum_absT.append(np.diag(aT).copy())
+            else:
+                sum_bispec.append(triple_sum)
+                sum_d1.append(d1)
+                sum_d2.append(d2)
+                sum_absT.append(aT)
+
+            n, n1, n2, n3 = self._bin_nphots(avg)
+            times.append(0.5 * (ts + te))
+            nseg.append(avg.m)
+            nph.append(n)
+            nph1.append(n1)
+            nph2.append(n2)
+            nph3.append(n3)
+
+        if freq is None:
+            raise ValueError("No usable time bins were found for the dynamical bispectrum.")
+        if n_skipped:
+            warnings.warn(f"{n_skipped} time bin(s) had no usable segments and were dropped.")
+
+        self.freq = np.asarray(freq)
+        self.valid = valid
+        self.valid_diag = np.diag(valid)
+        self.time = np.asarray(times)
+        self.nseg = np.asarray(nseg)
+        self.nphots = np.asarray(nph, dtype=float)
+        self.nphots1 = np.asarray(nph1, dtype=float)
+        self.nphots2 = np.asarray(nph2, dtype=float)
+        self.nphots3 = np.asarray(nph3, dtype=float)
+        self._sum_bispec = np.asarray(sum_bispec)
+        self._sum_denom1 = np.asarray(sum_d1)
+        self._sum_denom2 = np.asarray(sum_d2)
+        self._sum_absT = np.asarray(sum_absT)
+        self.df = float(self.freq[1] - self.freq[0]) if self.freq.size > 1 else None
+        self.dt = self.bin_size
+        self.m = int(self.nseg[0]) if self.nseg.size else None
+
+        self._recompute()
+
+    def _recompute(self):
+        """Derive ``dyn_bispec``/``dyn_bicoherence``/``dyn_biphase`` from the sums."""
+        if self.store == "diagonal":
+            valid = np.broadcast_to(self.valid_diag[None, :], self._sum_bispec.shape)
+            m = self.nseg[:, None]
+        else:
+            valid = np.broadcast_to(self.valid[None, :, :], self._sum_bispec.shape)
+            m = self.nseg[:, None, None]
+
+        with np.errstate(invalid="ignore", divide="ignore"):
+            mean_bispec = self._sum_bispec / m
+        self.dyn_bispec = np.where(valid, mean_bispec, np.nan)
+        self.dyn_biphase = np.where(valid, np.angle(self._sum_bispec), np.nan)
+        self.dyn_bicoherence = bicoherence_from_sums(
+            self.bicoherence_norm,
+            np.abs(self._sum_bispec),
+            self._sum_denom1,
+            self._sum_denom2,
+            self._sum_absT,
+            valid=valid,
+        )
+
+    def _diagonal(self, arr):
+        """Return the ``(n_time, nf)`` diagonal of a per-bin quantity."""
+        if self.store == "diagonal":
+            return arr
+        return np.diagonal(arr, axis1=1, axis2=2)
+
+    def _freq_index(self, f):
+        return int(np.argmin(np.abs(self.freq - f)))
+
+    def plot_diagonal(self, ax=None, cmap="viridis", vmin=0.0, vmax=1.0, colorbar=True):
+        r"""Plot the diagonal dynamical bicoherence ``b(nu, nu, t)``.
+
+        This is the closest analogue of the dynamical power spectrum: a
+        ``nu`` (with ``f1 = f2 = nu``) versus time image, where ``nu`` couples to
+        its harmonic ``2 nu``. Works from either store.
+        """
+        if self.dyn_bicoherence is None:
+            raise ValueError("This dynamical bispectrum has no data to plot.")
+        diag = self._diagonal(self.dyn_bicoherence)
+        if ax is None:
+            _, ax = plt.subplots()
+        pc = ax.pcolormesh(
+            _pixel_edges(self.time),
+            _pixel_edges(self.freq),
+            np.ma.masked_invalid(diag.T),
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
+        )
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel(r"$\nu$ (Hz), $f_1 = f_2 = \nu$")
+        ax.set_title("Diagonal dynamical bicoherence")
+        if colorbar:
+            ax.figure.colorbar(pc, ax=ax, label="bicoherence")
+        return ax
+
+    def plot_slice(self, f1, ax=None, cmap="viridis", vmin=0.0, vmax=1.0, colorbar=True):
+        """Plot the bicoherence at a fixed ``f1`` as a function of ``(f2, time)``.
+
+        Requires ``store="full"``.
+        """
+        if self.store != "full":
+            raise ValueError("plot_slice needs store='full'.")
+        i1 = self._freq_index(f1)
+        sl = self.dyn_bicoherence[:, i1, :]
+        if ax is None:
+            _, ax = plt.subplots()
+        pc = ax.pcolormesh(
+            _pixel_edges(self.time),
+            _pixel_edges(self.freq),
+            np.ma.masked_invalid(sl.T),
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
+        )
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("$f_2$ (Hz)")
+        ax.set_title(f"Bicoherence at $f_1 = {self.freq[i1]:g}$ Hz")
+        if colorbar:
+            ax.figure.colorbar(pc, ax=ax, label="bicoherence")
+        return ax
+
+    def plot_frame(self, t, ax=None, cmap="viridis", vmin=0.0, vmax=1.0, colorbar=True):
+        """Plot the full ``(f1, f2)`` bicoherence map at the time bin nearest ``t``.
+
+        Requires ``store="full"``.
+        """
+        if self.store != "full":
+            raise ValueError("plot_frame needs store='full'.")
+        k = int(np.argmin(np.abs(self.time - t)))
+        if ax is None:
+            _, ax = plt.subplots()
+        pc = ax.pcolormesh(
+            _pixel_edges(self.freq),
+            _pixel_edges(self.freq),
+            np.ma.masked_invalid(self.dyn_bicoherence[k].T),
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
+        )
+        ax.set_xlabel("$f_1$ (Hz)")
+        ax.set_ylabel("$f_2$ (Hz)")
+        ax.set_title(f"Bicoherence at t = {self.time[k]:g} s")
+        if colorbar:
+            ax.figure.colorbar(pc, ax=ax, label="bicoherence")
+        return ax
+
+    def plot_montage(self, times=None, ncols=5, cmap="viridis", vmin=0.0, vmax=1.0):
+        """Plot a grid of full ``(f1, f2)`` maps over time. Requires ``store="full"``."""
+        if self.store != "full":
+            raise ValueError("plot_montage needs store='full'.")
+        if times is None:
+            idx = np.arange(self.time.size)
+        else:
+            idx = [int(np.argmin(np.abs(self.time - t))) for t in np.atleast_1d(times)]
+        n = len(idx)
+        ncols = min(ncols, n)
+        nrows = int(np.ceil(n / ncols))
+        fig, axes = plt.subplots(
+            nrows, ncols, figsize=(3 * ncols, 3 * nrows), sharex=True, sharey=True, squeeze=False
+        )
+        for ax in axes.flat:
+            ax.set_visible(False)
+        pc = None
+        for k, ax in zip(idx, axes.flat):
+            ax.set_visible(True)
+            pc = ax.pcolormesh(
+                _pixel_edges(self.freq),
+                _pixel_edges(self.freq),
+                np.ma.masked_invalid(self.dyn_bicoherence[k].T),
+                cmap=cmap,
+                vmin=vmin,
+                vmax=vmax,
+            )
+            ax.set_title(f"t = {self.time[k]:g} s", fontsize=9)
+        fig.supxlabel("$f_1$ (Hz)")
+        fig.supylabel("$f_2$ (Hz)")
+        if pc is not None:
+            fig.colorbar(pc, ax=axes, fraction=0.02, pad=0.01, label="bicoherence")
+        return axes
+
+    def trace(self, f1, f2):
+        r"""Return ``(time, bicoherence(t), biphase(t))`` at a fixed ``(f1, f2)``.
+
+        For ``store="diagonal"`` only diagonal points (``f1 = f2``) are available.
+        """
+        i1, i2 = self._freq_index(f1), self._freq_index(f2)
+        if self.store == "diagonal":
+            if i1 != i2:
+                raise ValueError(
+                    "store='diagonal' only keeps f1 = f2; pass equal frequencies "
+                    "or rebuild with store='full'."
+                )
+            bic = self.dyn_bicoherence[:, i1]
+            bip = self.dyn_biphase[:, i1]
+        else:
+            bic = self.dyn_bicoherence[:, i1, i2]
+            bip = self.dyn_biphase[:, i1, i2]
+        return self.time, bic, bip
+
+    def plot_trace(self, f1, f2, axes=None):
+        """Plot the bicoherence and biphase at a fixed ``(f1, f2)`` versus time."""
+        time, bic, bip = self.trace(f1, f2)
+        if axes is None:
+            _, axes = plt.subplots(2, 1, sharex=True, figsize=(7, 5))
+        ax0, ax1 = axes
+        ax0.plot(time, bic, "o-", color="tab:blue")
+        ax0.axhline(1.0 / np.sqrt(self.m), color="0.5", ls=":", label=r"$1/\sqrt{m}$ floor")
+        ax0.set_ylabel("bicoherence")
+        ax0.set_ylim(0, 1.05)
+        ax0.legend(fontsize="small")
+        ax0.set_title(
+            f"Coupling at $(f_1, f_2) = ({self.freq[self._freq_index(f1)]:g}, "
+            f"{self.freq[self._freq_index(f2)]:g})$ Hz"
+        )
+        ax1.plot(time, bip, "o-", color="tab:orange")
+        ax1.set_ylabel("biphase (rad)")
+        ax1.set_xlabel("Time (s)")
+        ax1.set_ylim(-np.pi, np.pi)
+        return axes
+
+    def _rebinned_by_n_time(self, n):
+        """Return a copy with consecutive time bins summed in groups of ``n``."""
+        import copy as _copy
+
+        if n <= 1:
+            return _copy.deepcopy(self)
+        new = _copy.deepcopy(self)
+        nt = self.time.size
+        edges = range(0, nt - n + 1, n)
+
+        def group(arr, reducer):
+            return np.array([reducer(arr[i : i + n], axis=0) for i in edges])
+
+        new._sum_bispec = group(self._sum_bispec, np.sum)
+        new._sum_denom1 = group(self._sum_denom1, np.sum)
+        new._sum_denom2 = group(self._sum_denom2, np.sum)
+        new._sum_absT = group(self._sum_absT, np.sum)
+        new.time = group(self.time, np.mean)
+        new.nseg = group(self.nseg, np.sum)
+        for attr in ("nphots", "nphots1", "nphots2", "nphots3"):
+            new_attr = group(getattr(self, attr), np.mean)
+            setattr(new, attr, new_attr)
+        new.dt = self.dt * n
+        new.m = int(new.nseg[0]) if new.nseg.size else None
+        new._recompute()
+        return new
+
+    def rebin_by_n_intervals(self, n, method="sum"):
+        """Rebin in time by combining ``n`` consecutive intervals.
+
+        The additive bispectrum sums are combined (not the finished
+        bicoherence, which is a ratio and cannot be averaged), then the
+        bicoherence and biphase are recomputed. ``method`` is accepted for API
+        parity with :class:`DynamicalCrossspectrum` but the sums are always
+        summed.
+        """
+        if not np.issubdtype(type(n), np.integer):
+            warnings.warn("n must be an integer. Casting to int")
+            n = int(n)
+        if n < 1:
+            raise ValueError("n must be >= 1")
+        return self._rebinned_by_n_time(n)
+
+    def rebin_time(self, dt_new, method="sum"):
+        """Rebin to a coarser time resolution ``dt_new`` (an integer multiple of ``dt``).
+
+        Combines the additive sums over consecutive bins and recomputes the
+        bicoherence, so the result is the correct averaged bicoherence over the
+        wider bin -- not an average of bicoherence values.
+        """
+        if dt_new < self.dt:
+            raise ValueError("New time resolution must be larger than the current one.")
+        n = int(round(dt_new / self.dt))
+        return self._rebinned_by_n_time(max(n, 1))
+
+    def rebin_frequency(self, df_new, method="sum"):
+        """Rebin the (diagonal) frequency axis to a coarser ``df_new``.
+
+        Only implemented for ``store="diagonal"``. As for :meth:`rebin_time`, the
+        additive sums are combined and the bicoherence recomputed.
+        """
+        if self.store != "diagonal":
+            raise NotImplementedError(
+                "rebin_frequency is currently only implemented for store='diagonal'."
+            )
+        if df_new < self.df:
+            raise ValueError("New frequency resolution must be larger than the current one.")
+        import copy as _copy
+
+        n = int(round(df_new / self.df))
+        if n <= 1:
+            return _copy.deepcopy(self)
+        nf = self.freq.size
+        edges = range(0, nf - n + 1, n)
+
+        def group(arr, reducer, axis):
+            return np.stack([reducer(arr[:, i : i + n], axis=axis) for i in edges], axis=1)
+
+        new = _copy.deepcopy(self)
+        new._sum_bispec = group(self._sum_bispec, np.sum, 1)
+        new._sum_denom1 = group(self._sum_denom1, np.sum, 1)
+        new._sum_denom2 = group(self._sum_denom2, np.sum, 1)
+        new._sum_absT = group(self._sum_absT, np.sum, 1)
+        new.freq = np.array([np.mean(self.freq[i : i + n]) for i in edges])
+        # A rebinned diagonal frequency is resolved if all its members were.
+        new.valid_diag = np.array([np.all(self.valid_diag[i : i + n]) for i in edges])
+        new.df = self.df * n
+        new._recompute()
+        return new
+
+    def trace_maximum(self, min_freq=None, max_freq=None):
+        """Trace the peak-bicoherence diagonal frequency index in each time bin.
+
+        Returns the array of frequency indices (into ``freq``) of the maximum
+        diagonal bicoherence between ``min_freq`` and ``max_freq`` per bin -- the
+        bicoherence analogue of :meth:`DynamicalCrossspectrum.trace_maximum`.
+        """
+        if min_freq is None:
+            min_freq = np.min(self.freq)
+        if max_freq is None:
+            max_freq = np.max(self.freq)
+        band = (self.freq >= min_freq) & (self.freq <= max_freq) & self.valid_diag
+        diag = self._diagonal(self.dyn_bicoherence)
+        max_positions = []
+        for row in diag:
+            masked = np.where(band, row, -np.inf)
+            max_positions.append(int(np.nanargmax(masked)))
+        return np.array(max_positions)
+
+    def shift_and_add(self, f0_list, nbins=None):
+        r"""Shift-and-add the diagonal bicoherence, aligning each bin to its ``f0``.
+
+        For each time bin ``i`` the diagonal sums are shifted so that
+        ``f0_list[i]`` lands on a common reference bin, then co-added; the
+        bicoherence is recomputed from the co-added sums. This tracks a drifting
+        coupling (e.g. a QPO fundamental) the way the kHz-QPO shift-and-add
+        tracks a drifting Lorentzian.
+
+        Parameters
+        ----------
+        f0_list : iterable of float
+            The reference frequency in each time bin (length ``n_time``).
+
+        Other Parameters
+        ----------------
+        nbins : int, optional
+            Length of the output (relative-frequency) axis. Defaults to the
+            number of frequency bins.
+
+        Returns
+        -------
+        rel_freq : numpy.ndarray
+            Frequency relative to ``f0`` (0 at the reference).
+        bicoherence : numpy.ndarray
+            The shifted-and-added bicoherence.
+        biphase : numpy.ndarray
+            The corresponding biphase.
+        """
+        f0_list = np.atleast_1d(f0_list)
+        if f0_list.size != self.time.size:
+            raise ValueError("f0_list must have one entry per time bin.")
+        # Reference bin index of each f0 on the actual frequency axis (which does
+        # not start at 0, and is signed for the cross case), not round(f0/df).
+        k0 = np.array([self._freq_index(f) for f in f0_list])
+
+        st = self._diagonal(self._sum_bispec)
+        d1 = self._diagonal(self._sum_denom1)
+        d2 = self._diagonal(self._sum_denom2)
+        aT = self._diagonal(self._sum_absT)
+
+        L = int(nbins) if nbins is not None else self.freq.size
+        center = L // 2
+        out_st = np.zeros(L, dtype=complex)
+        out_d1 = np.zeros(L)
+        out_d2 = np.zeros(L)
+        out_aT = np.zeros(L)
+
+        src = np.arange(self.freq.size)
+        for i in range(self.time.size):
+            dst = src + (center - k0[i])
+            keep = (dst >= 0) & (dst < L) & self.valid_diag
+            out_st[dst[keep]] += st[i, keep]
+            out_d1[dst[keep]] += d1[i, keep]
+            out_d2[dst[keep]] += d2[i, keep]
+            out_aT[dst[keep]] += aT[i, keep]
+
+        bic = bicoherence_from_sums(self.bicoherence_norm, np.abs(out_st), out_d1, out_d2, out_aT)
+        rel_freq = (np.arange(L) - center) * self.df
+        return rel_freq, bic, np.angle(out_st)
+
+
+class DynamicalBispectrum(DynamicalCrossBispectrum):
+    type = "bispectrum"
+
+    r"""Make a time-resolved (dynamical) auto-bispectrum from a single input.
+
+    The auto special case of :class:`DynamicalCrossBispectrum` (the three
+    channels are the same light curve), analogous to
+    :class:`stingray.DynamicalPowerspectrum`. See
+    :class:`DynamicalCrossBispectrum` for the full description of the two time
+    scales (``segment_size``/``bin_size``), the ``store`` option, and the
+    plotting/rebinning/tracking methods.
+
+    Parameters
+    ----------
+    data : :class:`stingray.Lightcurve` or :class:`stingray.events.EventList`
+        The light curve or event list. For an event list, ``sample_time`` must
+        be given.
+    segment_size : float
+        Length, in seconds, of the FFT segments averaged inside each time bin.
+    bin_size : float
+        Length, in seconds, of each dynamical time bin.
+
+    Other Parameters
+    ----------------
+    See :class:`DynamicalCrossBispectrum` (``channels_overlap`` is always True
+    here).
+    """
+
+    def __init__(
+        self,
+        data=None,
+        segment_size=None,
+        bin_size=None,
+        bicoherence_norm="kim_powers",
+        poisson_subtract=False,
+        store="diagonal",
+        gti=None,
+        sample_time=None,
+        skip_checks=False,
+    ):
+        super().__init__(
+            data1=data,
+            segment_size=segment_size,
+            bin_size=bin_size,
+            bicoherence_norm=bicoherence_norm,
+            poisson_subtract=poisson_subtract,
+            channels_overlap=True,
+            store=store,
+            gti=gti,
+            sample_time=sample_time,
+            skip_checks=skip_checks,
+        )
+
+    def _build_bin(self, data1, data2, data3, bin_gti):
+        """Build the averaged auto-bispectrum for one time bin."""
+        return AveragedBispectrum(
+            data1,
+            segment_size=self.segment_size,
+            gti=bin_gti,
+            dt=self.sample_time,
+            bicoherence_norm=self.bicoherence_norm,
+            poisson_subtract=self.poisson_subtract,
+            silent=True,
+        )
+
+
 def _populate_bispectrum_from_result_table(bs, table):
     """Copy the columns and metadata from a fourier result table onto ``bs``.
 
@@ -1466,11 +2177,6 @@ def bispectrum_from_lc_iterable(
         save_diagonal=save_diagonal,
     )
     return _create_bispectrum_from_result_table(table, force_averaged=force_averaged)
-
-
-# ---------------------------------------------------------------------------
-# Cross-bispectrum module functions
-# ---------------------------------------------------------------------------
 
 
 def crossbispectrum_from_time_array(

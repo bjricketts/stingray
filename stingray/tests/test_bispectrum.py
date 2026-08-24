@@ -11,6 +11,8 @@ from stingray.bispectrum import (
     AveragedBispectrum,
     CrossBispectrum,
     AveragedCrossBispectrum,
+    DynamicalBispectrum,
+    DynamicalCrossBispectrum,
 )
 from stingray.fourier import (
     fftfreq,
@@ -908,3 +910,269 @@ class TestCrossBispectrum(object):
             channels_overlap=True,
         )
         assert overlap.poisson_subtracted is True
+
+
+def _blinking_diagonal_lc(rng_local, n_blocks, seg_per_block, n_bin, dt, nu, on):
+    """Auto light curve with harmonic (nu -> 2 nu) coupling switched per block.
+
+    ``on`` is a per-block boolean sequence; the diagonal bicoherence at ``nu``
+    should be high in the blocks where it is True and near the noise floor
+    elsewhere.
+    """
+    t = np.arange(n_bin) * dt
+    flux = []
+    for b in range(n_blocks):
+        for _ in range(seg_per_block):
+            pa = rng_local.uniform(0, 2 * np.pi)
+            s = 0.5 * np.cos(2 * np.pi * nu * t + pa)
+            phase2 = 2 * pa if on[b] else rng_local.uniform(0, 2 * np.pi)
+            s += 0.5 * np.cos(2 * np.pi * 2 * nu * t + phase2)
+            flux.append(rng_local.poisson(np.clip(500 * (1 + s), 0, None) * dt))
+    y = np.concatenate(flux).astype(float)
+    return Lightcurve(np.arange(y.size) * dt, y, dt=dt, skip_checks=True)
+
+
+class TestDynamicalBispectrum(object):
+    @classmethod
+    def setup_class(cls):
+        cls.dt = 0.01
+        cls.segment_size = 2.0
+        cls.bin_size = 80.0
+        cls.n_bin = int(cls.segment_size / cls.dt)
+        cls.nu = 4.0
+        cls.n_blocks = 8
+        cls.seg_per_block = 40
+        rng_local = np.random.RandomState(11)
+        # harmonic coupling ON only in the middle four blocks
+        cls.on = [False, False, True, True, True, True, False, False]
+        cls.lc = _blinking_diagonal_lc(
+            rng_local, cls.n_blocks, cls.seg_per_block, cls.n_bin, cls.dt, cls.nu, cls.on
+        )
+        cls.db = DynamicalBispectrum(
+            cls.lc,
+            segment_size=cls.segment_size,
+            bin_size=cls.bin_size,
+            bicoherence_norm="sigl_chamoun",
+        )
+
+    def teardown_method(self):
+        clear_all_figs()
+
+    def test_type_and_hierarchy(self):
+        assert self.db.type == "bispectrum"
+        assert isinstance(self.db, DynamicalCrossBispectrum)
+        # the auto case is a special case of the cross case
+        assert isinstance(DynamicalBispectrum(), DynamicalCrossBispectrum)
+
+    def test_shapes_and_two_time_scales(self):
+        assert self.db.time.size == self.n_blocks
+        # diagonal store: (n_time, nf)
+        assert self.db.dyn_bicoherence.shape == (self.n_blocks, self.db.freq.size)
+        assert self.db.dt == self.bin_size
+        assert self.db.m == self.seg_per_block
+        assert np.isclose(self.db.df, 1.0 / self.segment_size)
+
+    def test_empty(self):
+        db = DynamicalBispectrum()
+        assert db.freq is None
+        assert db.dyn_bicoherence is None
+        assert db.type == "bispectrum"
+
+    def test_requires_both_time_scales(self):
+        with pytest.raises(TypeError):
+            DynamicalBispectrum(self.lc, segment_size=self.segment_size)
+        with pytest.raises(TypeError):
+            DynamicalBispectrum(self.lc, bin_size=self.bin_size)
+
+    def test_bin_size_at_least_segment(self):
+        with pytest.raises(ValueError):
+            DynamicalBispectrum(self.lc, segment_size=2.0, bin_size=1.0)
+
+    def test_invalid_store(self):
+        with pytest.raises(ValueError):
+            DynamicalBispectrum(self.lc, segment_size=2.0, bin_size=80.0, store="nope")
+
+    def test_few_segments_per_bin_warns(self):
+        with pytest.warns(UserWarning):
+            DynamicalBispectrum(self.lc, segment_size=2.0, bin_size=6.0)
+
+    def test_detects_blinking_diagonal(self):
+        _, bic, _ = self.db.trace(self.nu, self.nu)
+        on = np.array(self.on)
+        assert np.all(bic[on] > 0.7)
+        assert np.all(bic[~on] < 0.5)
+
+    def test_trace_maximum_follows_the_harmonic(self):
+        # in the coupled blocks the peak diagonal bicoherence sits at nu
+        pos = self.db.trace_maximum(min_freq=1.0, max_freq=20.0)
+        peak_freqs = self.db.freq[pos]
+        on = np.array(self.on)
+        assert np.allclose(peak_freqs[on], self.nu)
+
+    def test_rebin_invariant(self):
+        # collapsing every time bin into one must equal a single AveragedBispectrum
+        merged = self.db.rebin_by_n_intervals(self.db.time.size)
+        full = AveragedBispectrum(
+            self.lc, segment_size=self.segment_size, bicoherence_norm="sigl_chamoun"
+        )
+        got = merged.dyn_bicoherence[0]
+        ref = np.diag(full.bicoherence)
+        assert np.allclose(np.nan_to_num(got), np.nan_to_num(ref), atol=1e-6)
+
+    def test_rebin_time(self):
+        rt = self.db.rebin_time(2 * self.bin_size)
+        assert rt.time.size == self.n_blocks // 2
+        assert rt.dt == 2 * self.bin_size
+        assert rt.m == 2 * self.seg_per_block
+
+    def test_rebin_time_must_increase(self):
+        with pytest.raises(ValueError):
+            self.db.rebin_time(self.bin_size / 2)
+
+    def test_rebin_frequency(self):
+        rf = self.db.rebin_frequency(2 * self.db.df)
+        assert rf.freq.size < self.db.freq.size
+        assert np.isclose(rf.df, 2 * self.db.df)
+
+    def test_shift_and_add(self):
+        # an always-coupled signal, so the aligned co-add stays strongly coherent
+        rng_local = np.random.RandomState(5)
+        lc = _blinking_diagonal_lc(
+            rng_local,
+            self.n_blocks,
+            self.seg_per_block,
+            self.n_bin,
+            self.dt,
+            self.nu,
+            [True] * self.n_blocks,
+        )
+        db = DynamicalBispectrum(
+            lc,
+            segment_size=self.segment_size,
+            bin_size=self.bin_size,
+            bicoherence_norm="sigl_chamoun",
+        )
+        rel_freq, bic, _ = db.shift_and_add(np.full(db.time.size, self.nu))
+        # the aligned coupling piles up at zero relative frequency
+        assert np.isclose(rel_freq[np.nanargmax(bic)], 0.0)
+        assert np.nanmax(bic) > 0.7
+
+    def test_shift_and_add_bad_length(self):
+        with pytest.raises(ValueError):
+            self.db.shift_and_add([self.nu, self.nu])
+
+    def test_plot_diagonal(self):
+        ax = self.db.plot_diagonal()
+        assert ax is not None
+
+    def test_diagonal_store_rejects_offdiagonal_ops(self):
+        with pytest.raises(ValueError):
+            self.db.trace(3.0, 7.0)
+        with pytest.raises(ValueError):
+            self.db.plot_slice(5.0)
+        with pytest.raises(ValueError):
+            self.db.plot_frame(self.db.time[0])
+
+    def test_full_store_slice_and_frame(self):
+        db = DynamicalBispectrum(
+            self.lc,
+            segment_size=self.segment_size,
+            bin_size=self.bin_size,
+            store="full",
+            bicoherence_norm="sigl_chamoun",
+        )
+        assert db.dyn_bicoherence.shape == (self.n_blocks, db.freq.size, db.freq.size)
+        assert db.plot_slice(self.nu) is not None
+        assert db.plot_frame(db.time[0]) is not None
+        # trace works off-diagonal with the full store
+        _, bic, _ = db.trace(self.nu, self.nu)
+        assert np.all(bic[np.array(self.on)] > 0.7)
+
+
+class TestDynamicalCrossBispectrum(object):
+    @classmethod
+    def setup_class(cls):
+        cls.dt = 0.01
+        cls.segment_size = 2.0
+        cls.bin_size = 60.0
+        cls.n_bin = int(cls.segment_size / cls.dt)
+        cls.f1, cls.f2 = 5.0, 12.0
+        rng_local = np.random.RandomState(7)
+        n_seg = 8 * 30
+        t = np.arange(cls.n_bin) * cls.dt
+        cx, cy, cz = [], [], []
+        for _ in range(n_seg):
+            p1, p2 = rng_local.uniform(0, 2 * np.pi, size=2)
+            cx.append(
+                rng_local.poisson(
+                    np.clip(500 * (1 + 0.5 * np.cos(2 * np.pi * cls.f1 * t + p1)), 0, None) * cls.dt
+                )
+            )
+            cy.append(
+                rng_local.poisson(
+                    np.clip(500 * (1 + 0.5 * np.cos(2 * np.pi * cls.f2 * t + p2)), 0, None) * cls.dt
+                )
+            )
+            cz.append(
+                rng_local.poisson(
+                    np.clip(
+                        500 * (1 + 0.5 * np.cos(2 * np.pi * (cls.f1 + cls.f2) * t + p1 + p2)),
+                        0,
+                        None,
+                    )
+                    * cls.dt
+                )
+            )
+
+        def lc(ch):
+            c = np.concatenate(ch).astype(float)
+            return Lightcurve(np.arange(c.size) * cls.dt, c, dt=cls.dt, skip_checks=True)
+
+        cls.lcX, cls.lcY, cls.lcZ = lc(cx), lc(cy), lc(cz)
+
+    def teardown_method(self):
+        clear_all_figs()
+
+    def test_signed_grid(self):
+        db = DynamicalCrossBispectrum(
+            self.lcX,
+            self.lcY,
+            self.lcZ,
+            segment_size=self.segment_size,
+            bin_size=self.bin_size,
+            store="full",
+            bicoherence_norm="sigl_chamoun",
+        )
+        assert db.type == "crossbispectrum"
+        assert np.any(db.freq < 0) and np.any(db.freq > 0)
+        # coupling at (f1, f2), absent at the swapped (f2, f1)
+        _, bic, _ = db.trace(self.f1, self.f2)
+        _, bsw, _ = db.trace(self.f2, self.f1)
+        assert np.all(bic > 0.7)
+        assert np.all(bsw < 0.5)
+
+    def test_reduces_to_auto(self):
+        # three identical inputs -> the diagonal matches the auto DynamicalBispectrum
+        cross = DynamicalCrossBispectrum(
+            self.lcX,
+            self.lcX,
+            self.lcX,
+            segment_size=self.segment_size,
+            bin_size=self.bin_size,
+            bicoherence_norm="sigl_chamoun",
+        )
+        auto = DynamicalBispectrum(
+            self.lcX,
+            segment_size=self.segment_size,
+            bin_size=self.bin_size,
+            bicoherence_norm="sigl_chamoun",
+        )
+        # match on the positive diagonal frequencies present in both grids
+        for nu in (self.f1, self.f2):
+            ic = int(np.argmin(np.abs(cross.freq - nu)))
+            ia = int(np.argmin(np.abs(auto.freq - nu)))
+            assert np.allclose(
+                np.nan_to_num(cross.dyn_bicoherence[:, ic]),
+                np.nan_to_num(auto.dyn_bicoherence[:, ia]),
+                atol=1e-6,
+            )
