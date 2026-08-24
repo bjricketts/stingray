@@ -3138,6 +3138,7 @@ def avg_bispectrum_from_iterable(
     poisson_subtract=False,
     silent=False,
     return_subbs=False,
+    save_diagonal=False,
 ):
     """Bispectrum, bicoherence and biphase from an iterable of segments.
 
@@ -3187,8 +3188,12 @@ def avg_bispectrum_from_iterable(
     silent : bool, default False
         Silence the progress bar.
     return_subbs : bool, default False
-        If True, also return the per-segment bispectra in the metadata (under
-        ``subbs``). Uses more memory.
+        If True, also return the full per-segment 2D bispectra in the metadata
+        (under ``subbs``). Uses a lot of memory (``m x nf x nf``).
+    save_diagonal : bool, default False
+        If True, return only the diagonal (``f1 = f2``) of each per-segment
+        bispectrum (under ``subbs_diagonal``, shape ``m x nf``). This is all a
+        jellyfish plot needs, at a fraction of the memory of ``return_subbs``.
 
     Returns
     -------
@@ -3227,6 +3232,7 @@ def avg_bispectrum_from_iterable(
     sum_of_photons = 0
     n_ave = 0
     subbs = [] if return_subbs else None
+    subbs_diag = [] if save_diagonal else None
 
     for flux in local_show_progress(flux_iterable):
         if flux is None or np.all(flux == 0):
@@ -3273,6 +3279,10 @@ def avg_bispectrum_from_iterable(
 
         if return_subbs:
             subbs.append(triple)
+        if save_diagonal:
+            # .copy() is essential: a np.diag view would keep the whole 2D
+            # ``triple`` alive, defeating the memory saving.
+            subbs_diag.append(np.diag(triple).copy())
 
         n_ave += 1
 
@@ -3344,6 +3354,8 @@ def avg_bispectrum_from_iterable(
     )
     if return_subbs:
         results.meta["subbs"] = subbs
+    if save_diagonal:
+        results.meta["subbs_diagonal"] = subbs_diag
     return results
 
 
@@ -3358,6 +3370,7 @@ def avg_bispectrum_from_timeseries(
     fluxes=None,
     errors=None,
     return_subbs=False,
+    save_diagonal=False,
 ):
     """Average bispectrum from event times or a light curve.
 
@@ -3390,7 +3403,10 @@ def avg_bispectrum_from_timeseries(
     errors : float `np.array`, default None
         Array of errors on the fluxes (currently unused by the estimator).
     return_subbs : bool, default False
-        Return all per-segment bispectra in the metadata.
+        Return the full per-segment 2D bispectra in the metadata.
+    save_diagonal : bool, default False
+        Return only the diagonal of each per-segment bispectrum. See
+        `avg_bispectrum_from_iterable`.
 
     Returns
     -------
@@ -3417,6 +3433,7 @@ def avg_bispectrum_from_timeseries(
         poisson_subtract=poisson_subtract,
         silent=silent,
         return_subbs=return_subbs,
+        save_diagonal=save_diagonal,
     )
     if bs is not None:
         bs.meta["gti"] = gti

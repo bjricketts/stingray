@@ -241,6 +241,7 @@ class Bispectrum(StingrayObject):
         poisson_subtract=False,
         silent=False,
         save_all=False,
+        save_diagonal=False,
     ):
         """Initialize the object, dispatching on the type of ``data``."""
         if isinstance(data, EventList):
@@ -253,6 +254,7 @@ class Bispectrum(StingrayObject):
                 poisson_subtract=poisson_subtract,
                 silent=silent,
                 save_all=save_all,
+                save_diagonal=save_diagonal,
             )
         elif isinstance(data, Lightcurve):
             spec = bispectrum_from_lightcurve(
@@ -263,6 +265,7 @@ class Bispectrum(StingrayObject):
                 poisson_subtract=poisson_subtract,
                 silent=silent,
                 save_all=save_all,
+                save_diagonal=save_diagonal,
             )
         elif isinstance(data, (tuple, list, Generator)):
             data = list(data)
@@ -278,6 +281,7 @@ class Bispectrum(StingrayObject):
                 poisson_subtract=poisson_subtract,
                 silent=silent,
                 save_all=save_all,
+                save_diagonal=save_diagonal,
             )
         else:  # pragma: no cover
             raise TypeError(f"Bad inputs to Bispectrum: {type(data)}")
@@ -300,6 +304,7 @@ class Bispectrum(StingrayObject):
         self.biphase_err = None
         self.valid = None
         self.bispec_all = None
+        self.bispec_diagonal = None
         self._bicoh_abs_bispec_sum = None
         self._bicoh_denom1 = None
         self._bicoh_denom2 = None
@@ -590,8 +595,8 @@ class Bispectrum(StingrayObject):
         near the origin, forming the "body". Reference circles of constant
         bicoherence give the scale.
 
-        This requires an averaged bispectrum built with ``save_all=True`` so
-        that the per-segment bispectra are available.
+        This requires an averaged bispectrum built with ``save_diagonal=True``
+        (which keeps only the diagonal the plot needs) or ``save_all=True``.
 
         Parameters
         ----------
@@ -630,13 +635,17 @@ class Bispectrum(StingrayObject):
         (uncorrected) bispectrum, so paths in the low-bicoherence body carry a
         noise contribution.
         """
-        if getattr(self, "bispec_all", None) is None:
+        # The jellyfish only needs the per-segment autobispectrum diagonal.
+        # Prefer the light ``bispec_diagonal`` store (save_diagonal=True); fall
+        # back to the full ``bispec_all`` cube (save_all=True).
+        diag_store = getattr(self, "bispec_diagonal", None)
+        full_store = getattr(self, "bispec_all", None)
+        if diag_store is None and full_store is None:
             raise ValueError(
                 "plot_jellyfish needs the per-segment bispectra. Build the "
-                "AveragedBispectrum with save_all=True."
+                "AveragedBispectrum with save_diagonal=True (light) or save_all=True."
             )
 
-        subbs = np.asarray(self.bispec_all)  # (m, nf, nf)
         nf = self.freq.size
         diag = np.arange(nf)
         valid_diag = diag[np.diag(self.valid)]
@@ -652,9 +661,13 @@ class Bispectrum(StingrayObject):
             self._bicoh_denom1[valid_diag, valid_diag] * self._bicoh_denom2[valid_diag, valid_diag]
         )
 
-        # Cumulative sum of the per-segment triples along the diagonal, starting
-        # from the origin. Shape (n_freq, m + 1).
-        diag_triples = subbs[:, valid_diag, valid_diag]  # (m, n_freq)
+        # Per-segment triples along the diagonal, shape (m, n_freq).
+        if diag_store is not None:
+            diag_triples = np.asarray(diag_store)[:, valid_diag]
+        else:
+            diag_triples = np.asarray(full_store)[:, valid_diag, valid_diag]
+
+        # Cumulative sum along the diagonal, starting from the origin.
         cumsum = np.cumsum(diag_triples, axis=0)
         paths = np.vstack([np.zeros(valid_diag.size), cumsum]) / norm[np.newaxis, :]
 
@@ -746,8 +759,14 @@ class AveragedBispectrum(Bispectrum):
         Do not show a progress bar.
 
     save_all : bool, default False
-        Save all intermediate bispectra used for the final average (under
-        ``bispec_all``). Use with care; this can fill up RAM.
+        Save all intermediate 2D bispectra used for the final average (under
+        ``bispec_all``). Use with care; the per-segment matrices are large
+        (``m x nf x nf``) and this can fill up RAM.
+
+    save_diagonal : bool, default False
+        Save only the diagonal (``f1 = f2``) of each intermediate bispectrum
+        (under ``bispec_diagonal``, shape ``m x nf``). This is all
+        :meth:`plot_jellyfish` needs, at a fraction of the ``save_all`` memory.
 
     skip_checks : bool, default False
         Skip initial checks, for speed or other reasons (you need to trust your
@@ -764,7 +783,11 @@ class AveragedBispectrum(Bispectrum):
         The size of each averaged segment.
 
     bispec_all : list of numpy.ndarray
-        Only present if ``save_all=True``: the per-segment bispectra.
+        Only present if ``save_all=True``: the full per-segment 2D bispectra.
+
+    bispec_diagonal : list of numpy.ndarray
+        Only present if ``save_diagonal=True``: the diagonal (``f1 = f2``) of
+        each per-segment bispectrum. Enough for :meth:`plot_jellyfish`.
     """
 
     def __init__(
@@ -777,6 +800,7 @@ class AveragedBispectrum(Bispectrum):
         poisson_subtract=False,
         silent=False,
         save_all=False,
+        save_diagonal=False,
         skip_checks=False,
         lc=None,
     ):
@@ -819,6 +843,7 @@ class AveragedBispectrum(Bispectrum):
             poisson_subtract=poisson_subtract,
             silent=silent,
             save_all=save_all,
+            save_diagonal=save_diagonal,
         )
 
     def initial_checks(self, data=None, dt=None, segment_size=None):
@@ -835,6 +860,7 @@ class AveragedBispectrum(Bispectrum):
         poisson_subtract=False,
         silent=False,
         save_all=False,
+        save_diagonal=False,
     ):
         """Calculate an :class:`AveragedBispectrum` from a light curve."""
         return bispectrum_from_lightcurve(
@@ -845,6 +871,7 @@ class AveragedBispectrum(Bispectrum):
             poisson_subtract=poisson_subtract,
             silent=silent,
             save_all=save_all,
+            save_diagonal=save_diagonal,
         )
 
     @staticmethod
@@ -857,6 +884,7 @@ class AveragedBispectrum(Bispectrum):
         poisson_subtract=False,
         silent=False,
         save_all=False,
+        save_diagonal=False,
     ):
         """Calculate an :class:`AveragedBispectrum` from an event list."""
         return bispectrum_from_events(
@@ -868,6 +896,7 @@ class AveragedBispectrum(Bispectrum):
             poisson_subtract=poisson_subtract,
             silent=silent,
             save_all=save_all,
+            save_diagonal=save_diagonal,
         )
 
     @staticmethod
@@ -880,6 +909,7 @@ class AveragedBispectrum(Bispectrum):
         poisson_subtract=False,
         silent=False,
         save_all=False,
+        save_diagonal=False,
     ):
         """Calculate an :class:`AveragedBispectrum` from an array of event times."""
         return bispectrum_from_time_array(
@@ -891,6 +921,7 @@ class AveragedBispectrum(Bispectrum):
             poisson_subtract=poisson_subtract,
             silent=silent,
             save_all=save_all,
+            save_diagonal=save_diagonal,
         )
 
     @staticmethod
@@ -904,6 +935,7 @@ class AveragedBispectrum(Bispectrum):
         poisson_subtract=False,
         silent=False,
         save_all=False,
+        save_diagonal=False,
     ):
         """Calculate an :class:`AveragedBispectrum` from a time series."""
         return bispectrum_from_stingray_timeseries(
@@ -916,6 +948,7 @@ class AveragedBispectrum(Bispectrum):
             poisson_subtract=poisson_subtract,
             silent=silent,
             save_all=save_all,
+            save_diagonal=save_diagonal,
         )
 
     @staticmethod
@@ -928,6 +961,7 @@ class AveragedBispectrum(Bispectrum):
         poisson_subtract=False,
         silent=False,
         save_all=False,
+        save_diagonal=False,
     ):
         """Calculate an :class:`AveragedBispectrum` from an iterable of light curves."""
         return bispectrum_from_lc_iterable(
@@ -939,6 +973,7 @@ class AveragedBispectrum(Bispectrum):
             poisson_subtract=poisson_subtract,
             silent=silent,
             save_all=save_all,
+            save_diagonal=save_diagonal,
         )
 
 
@@ -979,6 +1014,8 @@ def _create_bispectrum_from_result_table(table, force_averaged=False):
 
     if "subbs" in table.meta:
         bs.bispec_all = table.meta["subbs"]
+    if "subbs_diagonal" in table.meta:
+        bs.bispec_diagonal = table.meta["subbs_diagonal"]
 
     return bs
 
@@ -992,6 +1029,7 @@ def bispectrum_from_time_array(
     poisson_subtract=False,
     silent=False,
     save_all=False,
+    save_diagonal=False,
 ):
     """Calculate a bispectrum from an array of event times.
 
@@ -1014,7 +1052,10 @@ def bispectrum_from_time_array(
     silent : bool, default False
         Silence the progress bars.
     save_all : bool, default False
-        Save all intermediate bispectra used for the final average.
+        Save all intermediate 2D bispectra used for the final average.
+    save_diagonal : bool, default False
+        Save only the diagonal of each intermediate bispectrum (enough for a
+        jellyfish plot, far less memory than ``save_all``).
 
     Returns
     -------
@@ -1032,6 +1073,7 @@ def bispectrum_from_time_array(
         poisson_subtract=poisson_subtract,
         silent=silent,
         return_subbs=save_all,
+        save_diagonal=save_diagonal,
     )
     return _create_bispectrum_from_result_table(table, force_averaged=force_averaged)
 
@@ -1045,6 +1087,7 @@ def bispectrum_from_events(
     poisson_subtract=False,
     silent=False,
     save_all=False,
+    save_diagonal=False,
 ):
     """Calculate a bispectrum from an event list. See
     `bispectrum_from_time_array` for the parameters."""
@@ -1060,6 +1103,7 @@ def bispectrum_from_events(
         poisson_subtract=poisson_subtract,
         silent=silent,
         save_all=save_all,
+        save_diagonal=save_diagonal,
     )
 
 
@@ -1071,6 +1115,7 @@ def bispectrum_from_lightcurve(
     poisson_subtract=False,
     silent=False,
     save_all=False,
+    save_diagonal=False,
 ):
     """Calculate a bispectrum from a light curve. See
     `bispectrum_from_time_array` for the parameters."""
@@ -1092,6 +1137,7 @@ def bispectrum_from_lightcurve(
         fluxes=lc.counts,
         errors=err,
         return_subbs=save_all,
+        save_diagonal=save_diagonal,
     )
     return _create_bispectrum_from_result_table(table, force_averaged=force_averaged)
 
@@ -1106,6 +1152,7 @@ def bispectrum_from_stingray_timeseries(
     poisson_subtract=False,
     silent=False,
     save_all=False,
+    save_diagonal=False,
 ):
     """Calculate a bispectrum from a time series. See
     `bispectrum_from_time_array` for the parameters."""
@@ -1127,6 +1174,7 @@ def bispectrum_from_stingray_timeseries(
         fluxes=getattr(ts, flux_attr),
         errors=err,
         return_subbs=save_all,
+        save_diagonal=save_diagonal,
     )
     return _create_bispectrum_from_result_table(table, force_averaged=force_averaged)
 
@@ -1140,6 +1188,7 @@ def bispectrum_from_lc_iterable(
     poisson_subtract=False,
     silent=False,
     save_all=False,
+    save_diagonal=False,
 ):
     """Calculate an average bispectrum from an iterable of light curves.
 
@@ -1159,7 +1208,10 @@ def bispectrum_from_lc_iterable(
     silent : bool, default False
         Silence the progress bars.
     save_all : bool, default False
-        Save all intermediate bispectra used for the final average.
+        Save all intermediate 2D bispectra used for the final average.
+    save_diagonal : bool, default False
+        Save only the diagonal of each intermediate bispectrum (enough for a
+        jellyfish plot, far less memory than ``save_all``).
 
     Returns
     -------
@@ -1202,5 +1254,6 @@ def bispectrum_from_lc_iterable(
         poisson_subtract=poisson_subtract,
         silent=silent,
         return_subbs=save_all,
+        save_diagonal=save_diagonal,
     )
     return _create_bispectrum_from_result_table(table, force_averaged=force_averaged)

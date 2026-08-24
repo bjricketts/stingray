@@ -560,15 +560,47 @@ class TestBispectrumJellyfish(object):
             chunks.append(rng_local.poisson(np.clip(100 * (1 + 0.3 * s), 0, None) * dt))
         c = np.concatenate(chunks).astype(float)
         cls.lc = Lightcurve(np.arange(c.size) * dt, c, dt=dt, skip_checks=True)
+        cls.seg = seg
         cls.bs = AveragedBispectrum(cls.lc, segment_size=seg, save_all=True)
+        cls.bs_diag = AveragedBispectrum(cls.lc, segment_size=seg, save_diagonal=True)
 
     def teardown_method(self):
         clear_all_figs()
 
-    def test_requires_save_all(self):
-        bs = AveragedBispectrum(self.lc, segment_size=2.0)  # no save_all
+    def test_requires_per_segment_store(self):
+        bs = AveragedBispectrum(self.lc, segment_size=self.seg)  # neither store
         with pytest.raises(ValueError):
             bs.plot_jellyfish()
+
+    def test_save_diagonal_is_light(self):
+        nf = self.bs.freq.size
+        full = np.asarray(self.bs.bispec_all)
+        diag = np.asarray(self.bs_diag.bispec_diagonal)
+        assert full.shape == (self.bs.m, nf, nf)
+        assert diag.shape == (self.bs_diag.m, nf)
+        # save_diagonal keeps no full cube
+        assert self.bs_diag.bispec_all is None
+        assert diag.nbytes < full.nbytes
+
+    def test_save_diagonal_matches_full_diagonal(self):
+        full = np.asarray(self.bs.bispec_all)
+        diag = np.asarray(self.bs_diag.bispec_diagonal)
+        nf = self.bs.freq.size
+        assert np.allclose(diag, full[:, np.arange(nf), np.arange(nf)])
+
+    def test_jellyfish_from_diagonal_matches_full(self):
+        ax_full = self.bs.plot_jellyfish(f0=self.f0)
+        ax_diag = self.bs_diag.plot_jellyfish(f0=self.f0)
+        lines_full = ax_full.get_lines()
+        lines_diag = ax_diag.get_lines()
+        assert len(lines_full) == len(lines_diag)
+        for lf, ld in zip(lines_full, lines_diag):
+            assert np.allclose(lf.get_xdata(), ld.get_xdata())
+            assert np.allclose(lf.get_ydata(), ld.get_ydata())
+
+    def test_diagonal_store_plots(self):
+        ax = self.bs_diag.plot_jellyfish(f0=self.f0)
+        assert ax is not None
 
     def test_empty_requires_save_all(self):
         with pytest.raises(ValueError):
