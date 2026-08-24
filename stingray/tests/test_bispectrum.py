@@ -541,3 +541,125 @@ class TestBispectrumPlots(object):
     def test_plot_empty_raises(self):
         with pytest.raises(ValueError):
             Bispectrum().plot_mag()
+
+
+class TestBispectrumJellyfish(object):
+    @classmethod
+    def setup_class(cls):
+        # Small grid so the per-segment (2D) store stays light.
+        rng_local = np.random.RandomState(11)
+        dt, seg, nseg = 0.02, 2.0, 60
+        nb = int(seg / dt)  # 100 bins -> nf ~ 49
+        t = np.arange(nb) * dt
+        cls.f0 = 5.0
+        chunks = []
+        for _ in range(nseg):
+            p = rng_local.uniform(0, 2 * np.pi)
+            # fundamental at f0 plus a phase-locked harmonic at 2*f0
+            s = np.cos(2 * np.pi * cls.f0 * t + p) + np.cos(2 * np.pi * 2 * cls.f0 * t + 2 * p)
+            chunks.append(rng_local.poisson(np.clip(100 * (1 + 0.3 * s), 0, None) * dt))
+        c = np.concatenate(chunks).astype(float)
+        cls.lc = Lightcurve(np.arange(c.size) * dt, c, dt=dt, skip_checks=True)
+        cls.bs = AveragedBispectrum(cls.lc, segment_size=seg, save_all=True)
+
+    def teardown_method(self):
+        clear_all_figs()
+
+    def test_requires_save_all(self):
+        bs = AveragedBispectrum(self.lc, segment_size=2.0)  # no save_all
+        with pytest.raises(ValueError):
+            bs.plot_jellyfish()
+
+    def test_empty_requires_save_all(self):
+        with pytest.raises(ValueError):
+            Bispectrum().plot_jellyfish()
+
+    def test_returns_axes(self):
+        ax = self.bs.plot_jellyfish()
+        assert ax is not None
+
+    def test_highlight_f0(self):
+        ax = self.bs.plot_jellyfish(f0=self.f0)
+        labels = [t.get_text() for t in ax.get_legend().get_texts()]
+        assert "QPO fundamental" in labels
+        assert "subharmonic" in labels
+
+    def test_freqs_subset(self):
+        ax = self.bs.plot_jellyfish(freqs=[self.f0])
+        assert ax is not None
+
+    def test_endpoint_radius_is_bicoherence(self):
+        # The drawn fundamental path endpoint amplitude equals the (sigl_chamoun)
+        # bicoherence, and its angle is the biphase.
+        j = np.argmin(np.abs(self.bs.freq - self.f0))
+        subbs = np.asarray(self.bs.bispec_all)
+        norm = np.sqrt(self.bs._bicoh_denom1[j, j] * self.bs._bicoh_denom2[j, j])
+        endpoint = np.sum(subbs[:, j, j]) / norm
+        assert np.isclose(
+            np.abs(endpoint), self.bs.recompute_bicoherence("sigl_chamoun")[j, j], atol=1e-9
+        )
+        assert np.isclose(np.angle(endpoint), self.bs.biphase[j, j], atol=1e-9)
+
+    def test_plot_on_given_axis(self):
+        _, ax = plt.subplots()
+        out = self.bs.plot_jellyfish(ax=ax)
+        assert out is ax
+
+    def test_save(self, tmp_path):
+        fname = str(tmp_path / "jelly.png")
+        self.bs.plot_jellyfish(save=True, filename=fname)
+        assert os.path.exists(fname)
+
+
+class TestBispectrumPoisson(object):
+    @classmethod
+    def setup_class(cls):
+        rng_local = np.random.RandomState(55)
+        cls.dt = 0.02
+        cls.n_bin = 64
+        cls.segments = [rng_local.poisson(30, cls.n_bin).astype(float) for _ in range(80)]
+
+    def test_matches_manual_wirnitzer_correction(self):
+        freq, i1, i2, i3, valid = _bispectrum_frequency_grid(self.n_bin, self.dt)
+        acc = np.zeros((freq.size, freq.size), dtype=complex)
+        for s in self.segments:
+            ft = np.fft.fft(s)
+            p = (ft * ft.conj()).real
+            triple = ft[i1] * ft[i2] * np.conj(ft[i3])
+            triple = triple - (p[i1] + p[i2] + p[i3] - 2.0 * s.sum())
+            acc += triple
+        acc /= len(self.segments)
+        res = avg_bispectrum_from_iterable(
+            iter(self.segments), self.dt, poisson_subtract=True, silent=True
+        )
+        assert np.allclose(res.meta["bispec"][valid], acc[valid], atol=1e-9)
+
+    def test_flag_in_meta(self):
+        res = avg_bispectrum_from_iterable(
+            iter(self.segments), self.dt, poisson_subtract=True, silent=True
+        )
+        assert res.meta["poisson_subtract"] is True
+        res2 = avg_bispectrum_from_iterable(iter(self.segments), self.dt, silent=True)
+        assert res2.meta["poisson_subtract"] is False
+
+    def test_removes_bias_on_pure_noise(self):
+        # Pure Poisson noise: raw Re(B) is biased upward by ~ N, corrected ~ 0.
+        raw = avg_bispectrum_from_iterable(iter(self.segments), self.dt, silent=True)
+        cor = avg_bispectrum_from_iterable(
+            iter(self.segments), self.dt, poisson_subtract=True, silent=True
+        )
+        v = raw.meta["valid"]
+        n = raw.meta["nphots"]
+        assert np.nanmean(raw.meta["bispec"][v].real) > 0.5 * n
+        assert abs(np.nanmean(cor.meta["bispec"][v].real)) < 0.1 * n
+
+    def test_class_flag_propagates(self):
+        rng_local = np.random.RandomState(7)
+        c = rng_local.poisson(20, 64 * 40).astype(float)
+        lc = Lightcurve(np.arange(c.size) * 0.02, c, dt=0.02, skip_checks=True)
+        bs = AveragedBispectrum(lc, segment_size=64 * 0.02, poisson_subtract=True)
+        assert bs.poisson_subtracted is True
+        assert AveragedBispectrum(lc, segment_size=64 * 0.02).poisson_subtracted is False
+
+    def test_empty_flag_default(self):
+        assert Bispectrum().poisson_subtracted is False
