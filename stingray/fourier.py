@@ -41,6 +41,7 @@ __all__ = [
     "avg_bispectrum_from_iterable",
     "avg_bispectrum_from_timeseries",
     "bicoherence_from_sums",
+    "BICOHERENCE_NORMS",
 ]
 
 
@@ -3046,7 +3047,7 @@ def _bispectrum_frequency_grid(n_bin, dt):
 
 
 #: Recognised bicoherence normalizations (see ``bicoherence_from_sums``).
-
+BICOHERENCE_NORMS = ("kim_powers", "sigl_chamoun", "hagihira")
 
 
 def bicoherence_from_sums(norm, abs_bispec_sum, denom1, denom2, sum_abs_triple, valid=None):
@@ -3110,12 +3111,11 @@ def bicoherence_from_sums(norm, abs_bispec_sum, denom1, denom2, sum_abs_triple, 
     Returns
     -------
     bicoherence : `np.array`
-        The bicoherence, normalized to ``[0, 1]``.
+        The bicoherence, clipped to ``[0, 1]``.
     """
-    bicoherence_norms = ("kim_powers", "sigl_chamoun", "hagihira")
     norm = norm.lower()
-    if norm not in bicoherence_norms:
-        raise ValueError(f"Unknown bicoherence norm '{norm}'. Choose one of {bicoherence_norms}.")
+    if norm not in BICOHERENCE_NORMS:
+        raise ValueError(f"Unknown bicoherence norm '{norm}'. Choose one of {BICOHERENCE_NORMS}.")
 
     with np.errstate(invalid="ignore", divide="ignore"):
         if norm == "kim_powers":

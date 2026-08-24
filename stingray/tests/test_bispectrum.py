@@ -13,10 +13,10 @@ from stingray.fourier import (
     avg_bispectrum_from_iterable,
     avg_bispectrum_from_timeseries,
     bicoherence_from_sums,
+    BICOHERENCE_NORMS,
     _bispectrum_frequency_grid,
 )
 
-BICOHERENCE_NORMS = ("kim_powers", "sigl_chamoun", "hagihira")
 
 def clear_all_figs():
     fign = plt.get_fignums()

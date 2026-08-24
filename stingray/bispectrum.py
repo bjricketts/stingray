@@ -275,6 +275,7 @@ class Bispectrum(StingrayObject):
         self.bispec_err = None
         self.biphase_err = None
         self.valid = None
+        self.bispec_all = None
         self._bicoh_abs_bispec_sum = None
         self._bicoh_denom1 = None
         self._bicoh_denom2 = None
@@ -507,6 +508,157 @@ class Bispectrum(StingrayObject):
 
         if save:
             ax.figure.savefig(filename if filename is not None else default_filename)
+        return ax
+
+    def plot_jellyfish(
+        self,
+        f0=None,
+        freqs=None,
+        bicoherence_levels=(0.01, 0.05),
+        fundamental_color="tab:blue",
+        subharmonic_color="tab:orange",
+        other_color="0.6",
+        ax=None,
+        save=False,
+        filename=None,
+    ):
+        r"""Draw a "jellyfish plot" of the autobispectrum (Nathan et al. 2022).
+
+        For each frequency :math:`\nu` on the autobispectrum diagonal
+        (:math:`f_1 = f_2 = \nu`, which couples :math:`\nu` and its harmonic
+        :math:`2\nu`), the per-segment triple products
+        :math:`X_i(\nu) X_i(\nu) X_i^{*}(2\nu)` are accumulated segment by
+        segment and the running (cumulative) sum is traced as a path in the
+        complex plane. Each path is normalized so that the amplitude of its
+        end point equals the bicoherence (Sigl & Chamoun convention), and its
+        angle is the biphase.
+
+        Frequencies that are quadratically phase-coupled produce per-segment
+        contributions that point in a consistent direction, so their path walks
+        steadily outward into a "tentacle"; uncoupled frequencies random-walk
+        near the origin, forming the "body". Reference circles of constant
+        bicoherence give the scale.
+
+        This requires an averaged bispectrum built with ``save_all=True`` so
+        that the per-segment bispectra are available.
+
+        Parameters
+        ----------
+        f0 : float, optional
+            A reference (e.g. QPO fundamental) frequency to highlight. The
+            diagonal path closest to ``f0`` is drawn in ``fundamental_color``
+            (it couples the fundamental and its harmonic), and the path closest
+            to ``f0 / 2`` in ``subharmonic_color`` (the subharmonic and the
+            fundamental). If ``None``, every path is drawn in ``other_color``.
+
+        Other Parameters
+        ----------------
+        freqs : iterable of float, optional
+            The diagonal frequencies to draw. Defaults to every resolved
+            diagonal frequency (those for which :math:`2\nu` is at or below the
+            Nyquist frequency).
+        bicoherence_levels : iterable of float, default ``(0.01, 0.05)``
+            Radii, in bicoherence units, of the reference circles.
+        fundamental_color, subharmonic_color, other_color : color
+            Colors for the fundamental, subharmonic and remaining paths.
+        ax : ``matplotlib.axes.Axes``, optional
+            Axes to draw onto. A new one is created if ``None``.
+        save : bool, default ``False``
+            If ``True``, save the figure to ``filename``.
+        filename : str, optional
+            File name to save to. Defaults to ``bispec_jellyfish.png``.
+
+        Returns
+        -------
+        ax : ``matplotlib.axes.Axes``
+            The axes with the plot.
+
+        Notes
+        -----
+        The bispectrum is biased by Poisson noise; this plot shows the raw
+        (uncorrected) bispectrum, so paths in the low-bicoherence body carry a
+        noise contribution.
+        """
+        if getattr(self, "bispec_all", None) is None:
+            raise ValueError(
+                "plot_jellyfish needs the per-segment bispectra. Build the "
+                "AveragedBispectrum with save_all=True."
+            )
+
+        subbs = np.asarray(self.bispec_all)  # (m, nf, nf)
+        nf = self.freq.size
+        diag = np.arange(nf)
+        valid_diag = diag[np.diag(self.valid)]
+
+        if freqs is not None:
+            wanted = [int(np.argmin(np.abs(self.freq - f))) for f in np.atleast_1d(freqs)]
+            valid_diag = np.array([j for j in wanted if self.valid[j, j]])
+
+        if valid_diag.size == 0:
+            raise ValueError("No resolved diagonal frequencies to plot.")
+
+        norm = np.sqrt(
+            self._bicoh_denom1[valid_diag, valid_diag] * self._bicoh_denom2[valid_diag, valid_diag]
+        )
+
+        # Cumulative sum of the per-segment triples along the diagonal, starting
+        # from the origin. Shape (n_freq, m + 1).
+        diag_triples = subbs[:, valid_diag, valid_diag]  # (m, n_freq)
+        cumsum = np.cumsum(diag_triples, axis=0)
+        paths = np.vstack([np.zeros(valid_diag.size), cumsum]) / norm[np.newaxis, :]
+
+        j_fund = j_sub = None
+        if f0 is not None:
+            j_fund = valid_diag[np.argmin(np.abs(self.freq[valid_diag] - f0))]
+            j_sub = valid_diag[np.argmin(np.abs(self.freq[valid_diag] - f0 / 2.0))]
+
+        if ax is None:
+            _, ax = plt.subplots(figsize=(7, 7))
+
+        # Reference circles of constant bicoherence
+        theta = np.linspace(0, 2 * np.pi, 200)
+        for level in bicoherence_levels:
+            ax.plot(
+                level * np.cos(theta),
+                level * np.sin(theta),
+                ls="--",
+                color="0.7",
+                lw=1,
+                zorder=1,
+                label=f"bicoherence {level:g}",
+            )
+
+        # Draw the "other" paths first, highlighted ones on top
+        fund_label_done = sub_label_done = False
+        for col, j in enumerate(valid_diag):
+            path = paths[:, col]
+            if j == j_fund:
+                color, lw, z = fundamental_color, 1.8, 4
+                label = None if fund_label_done else "QPO fundamental"
+                fund_label_done = True
+            elif j == j_sub:
+                color, lw, z = subharmonic_color, 1.8, 4
+                label = None if sub_label_done else "subharmonic"
+                sub_label_done = True
+            else:
+                color, lw, z = other_color, 0.8, 2
+                label = None
+            ax.plot(path.real, path.imag, color=color, lw=lw, alpha=0.9, zorder=z, label=label)
+            ax.plot(path.real[-1], path.imag[-1], ".", color=color, ms=6, zorder=z + 1)
+
+        lim = 1.15 * max(np.max(np.abs(paths)), max(bicoherence_levels))
+        ax.set_xlim(-lim, lim)
+        ax.set_ylim(-lim, lim)
+        ax.set_aspect("equal")
+        ax.axhline(0, color="0.9", lw=0.8, zorder=0)
+        ax.axvline(0, color="0.9", lw=0.8, zorder=0)
+        ax.set_xlabel("Re(B)")
+        ax.set_ylabel("Im(B)")
+        ax.set_title("Bispectrum jellyfish plot")
+        ax.legend(loc="upper right", fontsize="small")
+
+        if save:
+            ax.figure.savefig(filename if filename is not None else "bispec_jellyfish.png")
         return ax
 
 
