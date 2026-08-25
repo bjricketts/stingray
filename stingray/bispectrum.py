@@ -3,6 +3,7 @@ from collections.abc import Generator, Iterable
 
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
 
 from stingray.base import StingrayObject
 
@@ -422,19 +423,32 @@ class CrossBispectrum(StingrayObject):
         """Plot the biphase as a function of frequency."""
         return self._plot_matrix(self.biphase, "Biphase", ax, save, filename, "bispec_phase.png")
 
-    def plot_bicoherence(self, ax=None, save=False, filename=None):
-        """Plot the bicoherence as a function of frequency."""
+    def plot_bicoherence(self, ax=None, save=False, filename=None, log=False):
+        """Plot the bicoherence as a function of frequency.
+
+        Set ``log=True`` to plot :math:`\\log_{10}` of the bicoherence, which
+        stretches the low end and makes weak couplings easier to see. Since the
+        bicoherence lies in ``[0, 1]``, the log is non-positive; bins that are
+        exactly zero (and the unresolved region) are left blank.
+        """
         return self._plot_matrix(
-            self.bicoherence, "Bicoherence", ax, save, filename, "bicoherence.png"
+            self.bicoherence, "Bicoherence", ax, save, filename, "bicoherence.png", log=log
         )
 
-    def _plot_matrix(self, matrix, title, ax, save, filename, default_filename):
+    def _plot_matrix(self, matrix, title, ax, save, filename, default_filename, log=False):
         """Shared helper for the 2D bispectrum plots."""
         if matrix is None:
             raise ValueError("This bispectrum has no data to plot.")
 
         if ax is None:
             _, ax = plt.subplots()
+
+        if log:
+            with np.errstate(divide="ignore", invalid="ignore"):
+                matrix = np.log10(matrix)
+            # log10 of zero/negative gives -inf/NaN; blank those bins out.
+            matrix = np.where(np.isfinite(matrix), matrix, np.nan)
+            title = f"log10({title})"
 
         # ``matrix[i, j]`` is indexed (f1, f2); transpose so that f1 is on the
         # x-axis (matters only for a non-symmetric, i.e. cross, bispectrum).
@@ -1516,25 +1530,37 @@ class DynamicalCrossBispectrum(AveragedCrossBispectrum):
 
     # -- plotting ----------------------------------------------------------
 
-    def plot_diagonal(self, ax=None, cmap="viridis", vmin=0.0, vmax=1.0, colorbar=True):
+    @staticmethod
+    def _mesh_norm(matrix, vmin, vmax, log):
+        """Masked data and ``pcolormesh`` colour-scale kwargs, linear or log.
+
+        For ``log=True`` a :class:`matplotlib.colors.LogNorm` is used, which keeps
+        the true bicoherence values on a log-spaced colour scale; zero and
+        unresolved (``NaN``) bins are masked out (``LogNorm`` cannot show them). A
+        non-positive ``vmin`` is treated as "autoscale" for the log case.
+        """
+        if log:
+            data = np.ma.masked_less_equal(np.ma.masked_invalid(matrix), 0.0)
+            lo = vmin if (vmin is not None and vmin > 0) else None
+            return data, {"norm": LogNorm(vmin=lo, vmax=vmax)}
+        return np.ma.masked_invalid(matrix), {"vmin": vmin, "vmax": vmax}
+
+    def plot_diagonal(self, ax=None, cmap="viridis", vmin=0.0, vmax=1.0, colorbar=True, log=False):
         r"""Plot the diagonal dynamical bicoherence ``b(nu, nu, t)``.
 
         This is the closest analogue of the dynamical power spectrum: a
         ``nu`` (with ``f1 = f2 = nu``) versus time image, where ``nu`` couples to
-        its harmonic ``2 nu``. Works from either store.
+        its harmonic ``2 nu``. Works from either store. Set ``log=True`` for a
+        logarithmic (``LogNorm``) colour scale.
         """
         if self.dyn_bicoherence is None:
             raise ValueError("This dynamical bispectrum has no data to plot.")
         diag = self._diagonal(self.dyn_bicoherence)
         if ax is None:
             _, ax = plt.subplots()
+        data, norm_kw = self._mesh_norm(diag.T, vmin, vmax, log)
         pc = ax.pcolormesh(
-            _pixel_edges(self.time),
-            _pixel_edges(self.freq),
-            np.ma.masked_invalid(diag.T),
-            cmap=cmap,
-            vmin=vmin,
-            vmax=vmax,
+            _pixel_edges(self.time), _pixel_edges(self.freq), data, cmap=cmap, **norm_kw
         )
         ax.set_xlabel("Time (s)")
         ax.set_ylabel(r"$\nu$ (Hz), $f_1 = f_2 = \nu$")
@@ -1543,10 +1569,11 @@ class DynamicalCrossBispectrum(AveragedCrossBispectrum):
             ax.figure.colorbar(pc, ax=ax, label="bicoherence")
         return ax
 
-    def plot_slice(self, f1, ax=None, cmap="viridis", vmin=0.0, vmax=1.0, colorbar=True):
+    def plot_slice(self, f1, ax=None, cmap="viridis", vmin=0.0, vmax=1.0, colorbar=True, log=False):
         """Plot the bicoherence at a fixed ``f1`` as a function of ``(f2, time)``.
 
-        Requires ``store="full"``.
+        Requires ``store="full"``. Set ``log=True`` for a logarithmic
+        (``LogNorm``) colour scale.
         """
         if self.store != "full":
             raise ValueError("plot_slice needs store='full'.")
@@ -1554,13 +1581,9 @@ class DynamicalCrossBispectrum(AveragedCrossBispectrum):
         sl = self.dyn_bicoherence[:, i1, :]
         if ax is None:
             _, ax = plt.subplots()
+        data, norm_kw = self._mesh_norm(sl.T, vmin, vmax, log)
         pc = ax.pcolormesh(
-            _pixel_edges(self.time),
-            _pixel_edges(self.freq),
-            np.ma.masked_invalid(sl.T),
-            cmap=cmap,
-            vmin=vmin,
-            vmax=vmax,
+            _pixel_edges(self.time), _pixel_edges(self.freq), data, cmap=cmap, **norm_kw
         )
         ax.set_xlabel("Time (s)")
         ax.set_ylabel("$f_2$ (Hz)")
@@ -1569,23 +1592,20 @@ class DynamicalCrossBispectrum(AveragedCrossBispectrum):
             ax.figure.colorbar(pc, ax=ax, label="bicoherence")
         return ax
 
-    def plot_frame(self, t, ax=None, cmap="viridis", vmin=0.0, vmax=1.0, colorbar=True):
+    def plot_frame(self, t, ax=None, cmap="viridis", vmin=0.0, vmax=1.0, colorbar=True, log=False):
         """Plot the full ``(f1, f2)`` bicoherence map at the time bin nearest ``t``.
 
-        Requires ``store="full"``.
+        Requires ``store="full"``. Set ``log=True`` for a logarithmic
+        (``LogNorm``) colour scale.
         """
         if self.store != "full":
             raise ValueError("plot_frame needs store='full'.")
         k = int(np.argmin(np.abs(self.time - t)))
         if ax is None:
             _, ax = plt.subplots()
+        data, norm_kw = self._mesh_norm(self.dyn_bicoherence[k].T, vmin, vmax, log)
         pc = ax.pcolormesh(
-            _pixel_edges(self.freq),
-            _pixel_edges(self.freq),
-            np.ma.masked_invalid(self.dyn_bicoherence[k].T),
-            cmap=cmap,
-            vmin=vmin,
-            vmax=vmax,
+            _pixel_edges(self.freq), _pixel_edges(self.freq), data, cmap=cmap, **norm_kw
         )
         ax.set_xlabel("$f_1$ (Hz)")
         ax.set_ylabel("$f_2$ (Hz)")
@@ -1594,8 +1614,11 @@ class DynamicalCrossBispectrum(AveragedCrossBispectrum):
             ax.figure.colorbar(pc, ax=ax, label="bicoherence")
         return ax
 
-    def plot_montage(self, times=None, ncols=5, cmap="viridis", vmin=0.0, vmax=1.0):
-        """Plot a grid of full ``(f1, f2)`` maps over time. Requires ``store="full"``."""
+    def plot_montage(self, times=None, ncols=5, cmap="viridis", vmin=0.0, vmax=1.0, log=False):
+        """Plot a grid of full ``(f1, f2)`` maps over time. Requires ``store="full"``.
+
+        Set ``log=True`` for a logarithmic (``LogNorm``) colour scale.
+        """
         if self.store != "full":
             raise ValueError("plot_montage needs store='full'.")
         if times is None:
@@ -1613,13 +1636,9 @@ class DynamicalCrossBispectrum(AveragedCrossBispectrum):
         pc = None
         for k, ax in zip(idx, axes.flat):
             ax.set_visible(True)
+            data, norm_kw = self._mesh_norm(self.dyn_bicoherence[k].T, vmin, vmax, log)
             pc = ax.pcolormesh(
-                _pixel_edges(self.freq),
-                _pixel_edges(self.freq),
-                np.ma.masked_invalid(self.dyn_bicoherence[k].T),
-                cmap=cmap,
-                vmin=vmin,
-                vmax=vmax,
+                _pixel_edges(self.freq), _pixel_edges(self.freq), data, cmap=cmap, **norm_kw
             )
             ax.set_title(f"t = {self.time[k]:g} s", fontsize=9)
         # figure-level axis labels (fig.supxlabel/supylabel need matplotlib >= 3.4,

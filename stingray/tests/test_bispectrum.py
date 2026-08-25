@@ -535,6 +535,11 @@ class TestBispectrumPlots(object):
         ax = self.bs.plot_bicoherence()
         assert ax is not None
 
+    def test_plot_bicoherence_log(self):
+        ax = self.bs.plot_bicoherence(log=True)
+        assert ax is not None
+        assert "log10" in ax.get_title().lower()
+
     def test_plot_on_given_axis(self):
         _, ax = plt.subplots()
         out = self.bs.plot_mag(ax=ax)
@@ -1064,6 +1069,14 @@ class TestDynamicalBispectrum(object):
         ax = self.db.plot_diagonal()
         assert ax is not None
 
+    def test_plot_diagonal_log(self):
+        from matplotlib.colors import LogNorm
+
+        ax = self.db.plot_diagonal(log=True)
+        assert ax is not None
+        # the mesh should carry a logarithmic norm
+        assert any(isinstance(c.norm, LogNorm) for c in ax.collections)
+
     def test_diagonal_store_rejects_offdiagonal_ops(self):
         with pytest.raises(ValueError):
             self.db.trace(3.0, 7.0)
@@ -1083,6 +1096,10 @@ class TestDynamicalBispectrum(object):
         assert db.dyn_bicoherence.shape == (self.n_blocks, db.freq.size, db.freq.size)
         assert db.plot_slice(self.nu) is not None
         assert db.plot_frame(db.time[0]) is not None
+        # log colour scale on the full-store plots
+        assert db.plot_slice(self.nu, log=True) is not None
+        assert db.plot_frame(db.time[0], log=True) is not None
+        assert db.plot_montage(log=True) is not None
         # trace works off-diagonal with the full store
         _, bic, _ = db.trace(self.nu, self.nu)
         assert np.all(bic[np.array(self.on)] > 0.7)
