@@ -468,6 +468,68 @@ class TestBispectrumNormalization(object):
         with pytest.raises(ValueError):
             Bispectrum().recompute_bicoherence("kim_powers")
 
+    def test_bias_subtract_removes_1_over_m(self):
+        # For the squared (kim_powers) norm the debiased value is raw - 1/M.
+        raw = AveragedBispectrum(
+            self.lc, segment_size=self.segment_size, bicoherence_norm="kim_powers"
+        )
+        deb = AveragedBispectrum(
+            self.lc,
+            segment_size=self.segment_size,
+            bicoherence_norm="kim_powers",
+            bias_subtract=True,
+        )
+        assert deb.bias_subtract is True
+        assert raw.bias_subtract is False
+        valid = raw.valid
+        # Exactly raw - 1/M, with NO clipping (below-floor values may be negative).
+        expected = raw.bicoherence[valid] - 1.0 / raw.m
+        assert np.allclose(deb.bicoherence[valid], expected, atol=1e-12)
+        # debiasing lowers the (noise-floor) bicoherence on average
+        assert np.nanmean(deb.bicoherence) <= np.nanmean(raw.bicoherence)
+
+    def test_bias_subtract_not_clipped_below_zero(self):
+        # The debiased squared bicoherence must be allowed to go negative, so that
+        # below-noise-floor / suspect statistics stay visible rather than hidden.
+        deb = AveragedBispectrum(
+            self.lc,
+            segment_size=self.segment_size,
+            bicoherence_norm="kim_powers",
+            bias_subtract=True,
+        )
+        assert np.nanmin(deb.bicoherence) < 0.0
+
+    def test_bias_subtract_recompute_matches_constructor(self):
+        raw = AveragedBispectrum(self.lc, segment_size=self.segment_size)
+        deb = AveragedBispectrum(self.lc, segment_size=self.segment_size, bias_subtract=True)
+        post = raw.recompute_bicoherence(bias_subtract=True)
+        assert np.allclose(np.nan_to_num(post), np.nan_to_num(deb.bicoherence), atol=1e-12)
+
+    def test_bias_subtract_sigl_finite_and_signed(self):
+        bs = AveragedBispectrum(
+            self.lc, segment_size=self.segment_size, bicoherence_norm="sigl_chamoun"
+        )
+        deb = bs.recompute_bicoherence(norm="sigl_chamoun", bias_subtract=True)
+        valid = bs.valid
+        # signed root: finite, <= 1, and may go negative (not clipped)
+        assert np.all(np.isfinite(deb[valid]))
+        assert np.all(deb[valid] <= 1.0)
+
+    def test_bias_subtract_hagihira_raises(self):
+        bs = AveragedBispectrum(self.lc, segment_size=self.segment_size)
+        with pytest.raises(ValueError):
+            bs.recompute_bicoherence(norm="hagihira", bias_subtract=True)
+
+    def test_bias_subtract_cross(self):
+        xbs = AveragedCrossBispectrum(
+            self.lc, self.lc, self.lc, segment_size=self.segment_size, bias_subtract=True
+        )
+        assert xbs.bias_subtract is True
+        valid = xbs.valid
+        # debiased values are finite and <= 1 (may be negative, so no >= 0 check)
+        assert np.all(np.isfinite(xbs.bicoherence[valid]))
+        assert np.all(xbs.bicoherence[valid] <= 1.0)
+
 
 class TestBispectrumIO(object):
     @classmethod
@@ -817,8 +879,10 @@ class TestCrossBispectrum(object):
     def test_recompute_bicoherence(self, norm):
         b = self.xbs.recompute_bicoherence(norm)
         valid = self.xbs.valid
+        # Bounded to [0, 1] by construction; the output is not clipped, so allow a
+        # numerical tolerance at the upper edge (a single segment gives b == 1).
         assert np.all(b[valid] >= 0)
-        assert np.all(b[valid] <= 1)
+        assert np.all(b[valid] <= 1 + 1e-10)
 
     def test_detects_cross_coupling(self):
         rng_local = np.random.RandomState(7)

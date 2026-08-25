@@ -3038,9 +3038,7 @@ def _bispectrum_frequency_grid(n_bin, dt, fullspec=False):
         ``(nf, nf)`` integer arrays with the FFT bin indices of ``f1`` and
         ``f2``.
     idx3_safe : `np.array`
-        ``(nf, nf)`` integer array with the FFT bin index of ``f1 + f2``,
-        clipped to a safe in-bounds value where the sum is unresolved (those
-        entries are masked out by ``valid``).
+        ``(nf, nf)`` integer array with the FFT bin index of ``f1 + f2``.
     valid : `np.array`
         ``(nf, nf)`` boolean mask, ``True`` where ``f1 + f2`` is resolved.
     """
@@ -3079,7 +3077,16 @@ def _bispectrum_frequency_grid(n_bin, dt, fullspec=False):
 BICOHERENCE_NORMS = ("kim_powers", "sigl_chamoun", "hagihira")
 
 
-def bicoherence_from_sums(norm, abs_bispec_sum, denom1, denom2, sum_abs_triple, valid=None):
+def bicoherence_from_sums(
+    norm,
+    abs_bispec_sum,
+    denom1,
+    denom2,
+    sum_abs_triple,
+    valid=None,
+    n_seg=None,
+    bias_subtract=False,
+):
     r"""Compute a bicoherence from the accumulated bispectrum sums.
 
     Given, for each frequency pair :math:`(f_1, f_2)`, the summed triple
@@ -3088,7 +3095,8 @@ def bicoherence_from_sums(norm, abs_bispec_sum, denom1, denom2, sum_abs_triple, 
     :math:`\sum_i |X_i(f_1) X_i(f_2)|^2` and :math:`\sum_i |X_i(f_1+f_2)|^2`,
     and the summed per-segment magnitude :math:`\sum_i |T_i|`, return the
     bicoherence under one of several normalizations. All variants lie in
-    ``[0, 1]``.
+    ``[0, 1]`` by construction (Cauchy-Schwarz for ``"kim_powers"`` /
+    ``"sigl_chamoun"``, the triangle inequality for ``"hagihira"``).
 
     Parameters
     ----------
@@ -3136,11 +3144,23 @@ def bicoherence_from_sums(norm, abs_bispec_sum, denom1, denom2, sum_abs_triple, 
         :math:`\sum_i |T_i|`.
     valid : `np.array`, optional
         Boolean mask; entries where it is ``False`` are set to ``NaN``.
+    n_seg : int, optional
+        Number of averaged segments, ``M``. Required when ``bias_subtract`` is
+        True.
+    bias_subtract : bool, default False
+        Subtract the statistical bias of the **squared** bicoherence. For
+        uncoupled signals the expected squared bicoherence is not zero but
+        :math:`\approx 1/M` with ``M = n_seg`` averaged segments (Fackrell 1996;
+        Elgar & Guza 1988; Kim & Powers 1979). With this option the bias is
+        removed in the squared domain, :math:`b^2 \rightarrow b^2 - 1/M`, and the
+        result mapped back to the requested normalization. Only defined for 
+        ``"kim_powers"`` (the squared form) and ``"sigl_chamoun"`` (its 
+        signed root); a ``ValueError`` is raised for ``"hagihira"``.
 
     Returns
     -------
     bicoherence : `np.array`
-        The bicoherence, clipped to ``[0, 1]``.
+        The bicoherence.
     """
     norm = norm.lower()
     if norm not in BICOHERENCE_NORMS:
@@ -3154,7 +3174,27 @@ def bicoherence_from_sums(norm, abs_bispec_sum, denom1, denom2, sum_abs_triple, 
         else:  # hagihira
             out = abs_bispec_sum / sum_abs_triple
 
-    out = np.clip(out, 0.0, 1.0)
+    if bias_subtract:
+        if n_seg is None or n_seg < 1:
+            raise ValueError(
+                "bias_subtract requires n_seg (the number of averaged segments, >= 1)."
+            )
+        # The squared bicoherence has an ~1/M noise floor for uncoupled signals
+        # (M = n_seg). Subtract it in the squared domain, then map back to the
+        # requested normalization.
+        if norm == "kim_powers":
+            out = out - 1.0 / n_seg
+        elif norm == "sigl_chamoun":
+            debiased_sq = out**2 - 1.0 / n_seg
+            # Signed square root, so a below-floor (negative) estimate keeps its
+            # sign instead of being folded back up to zero.
+            out = np.sign(debiased_sq) * np.sqrt(np.abs(debiased_sq))
+        else:  # hagihira
+            raise ValueError(
+                "bias_subtract (the 1/M bias) is defined for the squared Kim & Powers "
+                "bicoherence ('kim_powers') and its root ('sigl_chamoun'), not 'hagihira'."
+            )
+
     if valid is not None:
         out = np.where(valid, out, np.nan)
     return out
@@ -3165,6 +3205,7 @@ def avg_bispectrum_from_iterable(
     dt,
     bicoherence_norm="kim_powers",
     poisson_subtract=False,
+    bias_subtract=False,
     silent=False,
     return_subbs=False,
     save_diagonal=False,
@@ -3323,7 +3364,14 @@ def avg_bispectrum_from_iterable(
 
     abs_bispec_sum = np.abs(bispec_sum)
     bicoherence = bicoherence_from_sums(
-        bicoherence_norm, abs_bispec_sum, denom1_sum, denom2_sum, abs_triple_sum, valid=valid
+        bicoherence_norm,
+        abs_bispec_sum,
+        denom1_sum,
+        denom2_sum,
+        abs_triple_sum,
+        valid=valid,
+        n_seg=m,
+        bias_subtract=bias_subtract,
     )
 
     biphase = np.angle(bispec)
@@ -3332,14 +3380,11 @@ def avg_bispectrum_from_iterable(
     if m > 1:
         var_re = sum_sq_re / m - bispec.real**2
         var_im = sum_sq_im / m - bispec.imag**2
-        var_re = np.clip(var_re, 0.0, None)
-        var_im = np.clip(var_im, 0.0, None)
         bispec_err = np.sqrt((var_re + var_im) / m)
 
         # Circular standard error of the biphase (Fisher 1993). rbar is the
         # mean resultant length of the per-segment biphase phasors.
         rbar = np.sqrt(cos_sum**2 + sin_sum**2) / m
-        rbar = np.clip(rbar, 1e-12, 1.0)
         with np.errstate(invalid="ignore", divide="ignore"):
             circ_std = np.sqrt(-2.0 * np.log(rbar))
         biphase_err = circ_std / np.sqrt(m)
@@ -3363,6 +3408,7 @@ def avg_bispectrum_from_iterable(
             "bicoherence": bicoherence,
             "bicoherence_norm": bicoherence_norm,
             "poisson_subtract": poisson_subtract,
+            "bias_subtract": bias_subtract,
             "biphase": biphase,
             "bispec_err": bispec_err,
             "biphase_err": biphase_err,
@@ -3395,6 +3441,7 @@ def avg_bispectrum_from_timeseries(
     dt,
     bicoherence_norm="kim_powers",
     poisson_subtract=False,
+    bias_subtract=False,
     silent=False,
     fluxes=None,
     errors=None,
@@ -3460,6 +3507,7 @@ def avg_bispectrum_from_timeseries(
         dt,
         bicoherence_norm=bicoherence_norm,
         poisson_subtract=poisson_subtract,
+        bias_subtract=bias_subtract,
         silent=silent,
         return_subbs=return_subbs,
         save_diagonal=save_diagonal,
@@ -3476,6 +3524,7 @@ def avg_cross_bispectrum_from_iterables(
     dt,
     bicoherence_norm="kim_powers",
     poisson_subtract=False,
+    bias_subtract=False,
     channels_overlap=False,
     silent=False,
     return_subbs=False,
@@ -3623,16 +3672,23 @@ def avg_cross_bispectrum_from_iterables(
 
     abs_bispec_sum = np.abs(bispec_sum)
     bicoherence = bicoherence_from_sums(
-        bicoherence_norm, abs_bispec_sum, denom1_sum, denom2_sum, abs_triple_sum, valid=valid
+        bicoherence_norm,
+        abs_bispec_sum,
+        denom1_sum,
+        denom2_sum,
+        abs_triple_sum,
+        valid=valid,
+        n_seg=m,
+        bias_subtract=bias_subtract,
     )
 
     biphase = np.angle(bispec)
 
     if m > 1:
-        var_re = np.clip(sum_sq_re / m - bispec.real**2, 0.0, None)
-        var_im = np.clip(sum_sq_im / m - bispec.imag**2, 0.0, None)
+        var_re = sum_sq_re / m - bispec.real**2
+        var_im = sum_sq_im / m - bispec.imag**2
         bispec_err = np.sqrt((var_re + var_im) / m)
-        rbar = np.clip(np.sqrt(cos_sum**2 + sin_sum**2) / m, 1e-12, 1.0)
+        rbar = np.sqrt(cos_sum**2 + sin_sum**2) / m
         with np.errstate(invalid="ignore", divide="ignore"):
             circ_std = np.sqrt(-2.0 * np.log(rbar))
         biphase_err = circ_std / np.sqrt(m)
@@ -3657,6 +3713,7 @@ def avg_cross_bispectrum_from_iterables(
             "bicoherence": bicoherence,
             "bicoherence_norm": bicoherence_norm,
             "poisson_subtract": poisson_subtract and channels_overlap,
+            "bias_subtract": bias_subtract,
             "channels_overlap": channels_overlap,
             "biphase": biphase,
             "bispec_err": bispec_err,
@@ -3695,6 +3752,7 @@ def avg_cross_bispectrum_from_timeseries(
     dt,
     bicoherence_norm="kim_powers",
     poisson_subtract=False,
+    bias_subtract=False,
     channels_overlap=False,
     silent=False,
     fluxes1=None,
@@ -3734,6 +3792,7 @@ def avg_cross_bispectrum_from_timeseries(
         dt,
         bicoherence_norm=bicoherence_norm,
         poisson_subtract=poisson_subtract,
+        bias_subtract=bias_subtract,
         channels_overlap=channels_overlap,
         silent=silent,
         return_subbs=return_subbs,

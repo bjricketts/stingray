@@ -90,6 +90,13 @@ class CrossBispectrum(StingrayObject):
         ``channels_overlap`` is True; for independent channels the Poisson noise
         is uncorrelated between factors and the cross-bispectrum is unbiased.
 
+    bias_subtract : bool, default False
+        Subtract the ``~1/M`` statistical bias of the squared bicoherence, where
+        ``M`` is the number of averaged segments (Fackrell 1996; Elgar & Guza
+        1988). Only defined for the ``"kim_powers"`` and ``"sigl_chamoun"``
+        normalizations. Can also be toggled after the fact with
+        :meth:`recompute_bicoherence`.
+
     channels_overlap : bool, default False
         Whether the three channels are the same photon stream. Independent
         energy bands (the usual cross case): leave ``False``.
@@ -115,6 +122,10 @@ class CrossBispectrum(StingrayObject):
 
     poisson_subtracted : bool
         Whether the Poisson-noise bias was subtracted.
+
+    bias_subtract : bool
+        Whether the ``~1/M`` statistical bias of the squared bicoherence was
+        subtracted.
 
     channels_overlap : bool
         Whether the input channels share the same photons.
@@ -160,6 +171,7 @@ class CrossBispectrum(StingrayObject):
         gti=None,
         bicoherence_norm="kim_powers",
         poisson_subtract=False,
+        bias_subtract=False,
         channels_overlap=False,
         skip_checks=False,
     ):
@@ -180,6 +192,7 @@ class CrossBispectrum(StingrayObject):
         self.bicoherence_norm = bicoherence_norm
         self.channels_overlap = channels_overlap
         self.poisson_subtracted = poisson_subtract and channels_overlap
+        self.bias_subtract = bias_subtract
 
         if not good_input:
             return self._initialize_empty()
@@ -192,6 +205,7 @@ class CrossBispectrum(StingrayObject):
             gti=gti,
             bicoherence_norm=bicoherence_norm,
             poisson_subtract=poisson_subtract,
+            bias_subtract=bias_subtract,
             channels_overlap=channels_overlap,
         )
 
@@ -238,6 +252,7 @@ class CrossBispectrum(StingrayObject):
         gti=None,
         bicoherence_norm="kim_powers",
         poisson_subtract=False,
+        bias_subtract=False,
         channels_overlap=False,
         silent=False,
         save_all=False,
@@ -249,6 +264,7 @@ class CrossBispectrum(StingrayObject):
             gti=gti,
             bicoherence_norm=bicoherence_norm,
             poisson_subtract=poisson_subtract,
+            bias_subtract=bias_subtract,
             channels_overlap=channels_overlap,
             silent=silent,
             save_all=save_all,
@@ -278,6 +294,7 @@ class CrossBispectrum(StingrayObject):
         self.bicoherence = None
         self.bicoherence_norm = getattr(self, "bicoherence_norm", "kim_powers")
         self.poisson_subtracted = getattr(self, "poisson_subtracted", False)
+        self.bias_subtract = getattr(self, "bias_subtract", False)
         self.channels_overlap = getattr(self, "channels_overlap", False)
         self.biphase = None
         self.bispec_mag = None
@@ -303,22 +320,28 @@ class CrossBispectrum(StingrayObject):
         self.gti = None
         return
 
-    def recompute_bicoherence(self, norm, inplace=False):
-        """Recompute the bicoherence under a different normalization.
+    def recompute_bicoherence(self, norm=None, bias_subtract=False, inplace=False):
+        """Recompute the bicoherence under a different normalization or debiasing.
 
         Uses the accumulated bispectrum sums stored on the object, so no FFTs
         are recomputed. See :class:`Bispectrum` for the definitions.
 
         Parameters
         ----------
-        norm : {"kim_powers", "sigl_chamoun", "hagihira"}
-            The bicoherence normalization.
+        norm : {"kim_powers", "sigl_chamoun", "hagihira"}, optional
+            The bicoherence normalization. Defaults to the object's current
+            ``bicoherence_norm`` (useful when only toggling ``bias_subtract``).
 
         Other Parameters
         ----------------
+        bias_subtract : bool, default False
+            Subtract the ``~1/M`` statistical bias of the squared bicoherence
+            (``M`` = number of averaged segments; Fackrell 1996, Elgar & Guza
+            1988). See :func:`stingray.fourier.bicoherence_from_sums`. Only
+            defined for ``"kim_powers"`` and ``"sigl_chamoun"``.
         inplace : bool, default False
-            If ``True``, also overwrite ``self.bicoherence`` and
-            ``self.bicoherence_norm``.
+            If ``True``, also overwrite ``self.bicoherence``,
+            ``self.bicoherence_norm`` and ``self.bias_subtract``.
 
         Returns
         -------
@@ -327,6 +350,8 @@ class CrossBispectrum(StingrayObject):
         """
         if getattr(self, "_bicoh_denom1", None) is None:
             raise ValueError("This bispectrum has no data to compute a bicoherence from.")
+        if norm is None:
+            norm = self.bicoherence_norm
         bicoh = bicoherence_from_sums(
             norm,
             self._bicoh_abs_bispec_sum,
@@ -334,10 +359,13 @@ class CrossBispectrum(StingrayObject):
             self._bicoh_denom2,
             self._bicoh_sum_abs,
             valid=self.valid,
+            n_seg=self.m,
+            bias_subtract=bias_subtract,
         )
         if inplace:
             self.bicoherence = bicoh
             self.bicoherence_norm = norm.lower()
+            self.bias_subtract = bias_subtract
         return bicoh
 
     @staticmethod
@@ -348,6 +376,7 @@ class CrossBispectrum(StingrayObject):
         gti=None,
         bicoherence_norm="kim_powers",
         poisson_subtract=False,
+        bias_subtract=False,
         channels_overlap=False,
         silent=False,
     ):
@@ -359,6 +388,7 @@ class CrossBispectrum(StingrayObject):
             gti=gti,
             bicoherence_norm=bicoherence_norm,
             poisson_subtract=poisson_subtract,
+            bias_subtract=bias_subtract,
             channels_overlap=channels_overlap,
             silent=silent,
         )
@@ -372,6 +402,7 @@ class CrossBispectrum(StingrayObject):
         gti=None,
         bicoherence_norm="kim_powers",
         poisson_subtract=False,
+        bias_subtract=False,
         channels_overlap=False,
         silent=False,
     ):
@@ -384,6 +415,7 @@ class CrossBispectrum(StingrayObject):
             gti=gti,
             bicoherence_norm=bicoherence_norm,
             poisson_subtract=poisson_subtract,
+            bias_subtract=bias_subtract,
             channels_overlap=channels_overlap,
             silent=silent,
         )
@@ -397,6 +429,7 @@ class CrossBispectrum(StingrayObject):
         gti=None,
         bicoherence_norm="kim_powers",
         poisson_subtract=False,
+        bias_subtract=False,
         channels_overlap=False,
         silent=False,
     ):
@@ -409,6 +442,7 @@ class CrossBispectrum(StingrayObject):
             gti=gti,
             bicoherence_norm=bicoherence_norm,
             poisson_subtract=poisson_subtract,
+            bias_subtract=bias_subtract,
             channels_overlap=channels_overlap,
             silent=silent,
         )
@@ -645,6 +679,7 @@ class AveragedCrossBispectrum(CrossBispectrum):
         dt=None,
         bicoherence_norm="kim_powers",
         poisson_subtract=False,
+        bias_subtract=False,
         channels_overlap=False,
         silent=False,
         save_all=False,
@@ -669,6 +704,7 @@ class AveragedCrossBispectrum(CrossBispectrum):
         self.bicoherence_norm = bicoherence_norm
         self.channels_overlap = channels_overlap
         self.poisson_subtracted = poisson_subtract and channels_overlap
+        self.bias_subtract = bias_subtract
         self.segment_size = segment_size
         self.save_all = save_all
 
@@ -684,6 +720,7 @@ class AveragedCrossBispectrum(CrossBispectrum):
             gti=gti,
             bicoherence_norm=bicoherence_norm,
             poisson_subtract=poisson_subtract,
+            bias_subtract=bias_subtract,
             channels_overlap=channels_overlap,
             silent=silent,
             save_all=save_all,
@@ -706,6 +743,7 @@ class AveragedCrossBispectrum(CrossBispectrum):
         gti=None,
         bicoherence_norm="kim_powers",
         poisson_subtract=False,
+        bias_subtract=False,
         channels_overlap=False,
         silent=False,
         save_all=False,
@@ -720,6 +758,7 @@ class AveragedCrossBispectrum(CrossBispectrum):
             gti=gti,
             bicoherence_norm=bicoherence_norm,
             poisson_subtract=poisson_subtract,
+            bias_subtract=bias_subtract,
             channels_overlap=channels_overlap,
             silent=silent,
             save_all=save_all,
@@ -736,6 +775,7 @@ class AveragedCrossBispectrum(CrossBispectrum):
         gti=None,
         bicoherence_norm="kim_powers",
         poisson_subtract=False,
+        bias_subtract=False,
         channels_overlap=False,
         silent=False,
         save_all=False,
@@ -751,6 +791,7 @@ class AveragedCrossBispectrum(CrossBispectrum):
             gti=gti,
             bicoherence_norm=bicoherence_norm,
             poisson_subtract=poisson_subtract,
+            bias_subtract=bias_subtract,
             channels_overlap=channels_overlap,
             silent=silent,
             save_all=save_all,
@@ -812,6 +853,13 @@ class Bispectrum(CrossBispectrum):
         :math:`T_i - |X_i(f_1)|^2 - |X_i(f_2)|^2 - |X_i(f_1+f_2)|^2 + 2N_i`.
         Only appropriate for photon-counting light curves given in counts.
 
+    bias_subtract : bool, default False
+        Subtract the ``~1/M`` statistical bias of the squared bicoherence, where
+        ``M`` is the number of averaged segments (Fackrell 1996; Elgar & Guza
+        1988). Only defined for the ``"kim_powers"`` and ``"sigl_chamoun"``
+        normalizations. Can also be toggled after the fact with
+        :meth:`recompute_bicoherence`.
+
     skip_checks : bool, default False
         Skip initial checks.
 
@@ -830,6 +878,7 @@ class Bispectrum(CrossBispectrum):
         gti=None,
         bicoherence_norm="kim_powers",
         poisson_subtract=False,
+        bias_subtract=False,
         skip_checks=False,
         lc=None,
     ):
@@ -847,6 +896,7 @@ class Bispectrum(CrossBispectrum):
         self.gti = gti
         self.bicoherence_norm = bicoherence_norm
         self.poisson_subtracted = poisson_subtract
+        self.bias_subtract = bias_subtract
         self.channels_overlap = True  # the auto case is fully overlapping
 
         if not good_input:
@@ -858,6 +908,7 @@ class Bispectrum(CrossBispectrum):
             gti=gti,
             bicoherence_norm=bicoherence_norm,
             poisson_subtract=poisson_subtract,
+            bias_subtract=bias_subtract,
         )
 
     def initial_checks(self, data=None, dt=None, segment_size=None):
@@ -885,6 +936,7 @@ class Bispectrum(CrossBispectrum):
         gti=None,
         bicoherence_norm="kim_powers",
         poisson_subtract=False,
+        bias_subtract=False,
         silent=False,
         save_all=False,
         save_diagonal=False,
@@ -895,6 +947,7 @@ class Bispectrum(CrossBispectrum):
             gti=gti,
             bicoherence_norm=bicoherence_norm,
             poisson_subtract=poisson_subtract,
+            bias_subtract=bias_subtract,
             silent=silent,
             save_all=save_all,
             save_diagonal=save_diagonal,
@@ -918,7 +971,12 @@ class Bispectrum(CrossBispectrum):
 
     @staticmethod
     def from_lightcurve(
-        lc, gti=None, bicoherence_norm="kim_powers", poisson_subtract=False, silent=False
+        lc,
+        gti=None,
+        bicoherence_norm="kim_powers",
+        poisson_subtract=False,
+        bias_subtract=False,
+        silent=False,
     ):
         """Calculate a :class:`Bispectrum` from a light curve."""
         return bispectrum_from_lightcurve(
@@ -926,12 +984,19 @@ class Bispectrum(CrossBispectrum):
             gti=gti,
             bicoherence_norm=bicoherence_norm,
             poisson_subtract=poisson_subtract,
+            bias_subtract=bias_subtract,
             silent=silent,
         )
 
     @staticmethod
     def from_events(
-        events, dt, gti=None, bicoherence_norm="kim_powers", poisson_subtract=False, silent=False
+        events,
+        dt,
+        gti=None,
+        bicoherence_norm="kim_powers",
+        poisson_subtract=False,
+        bias_subtract=False,
+        silent=False,
     ):
         """Calculate a :class:`Bispectrum` from an event list."""
         return bispectrum_from_events(
@@ -940,12 +1005,19 @@ class Bispectrum(CrossBispectrum):
             gti=gti,
             bicoherence_norm=bicoherence_norm,
             poisson_subtract=poisson_subtract,
+            bias_subtract=bias_subtract,
             silent=silent,
         )
 
     @staticmethod
     def from_time_array(
-        times, dt, gti=None, bicoherence_norm="kim_powers", poisson_subtract=False, silent=False
+        times,
+        dt,
+        gti=None,
+        bicoherence_norm="kim_powers",
+        poisson_subtract=False,
+        bias_subtract=False,
+        silent=False,
     ):
         """Calculate a :class:`Bispectrum` from an array of event times."""
         return bispectrum_from_time_array(
@@ -954,6 +1026,7 @@ class Bispectrum(CrossBispectrum):
             gti=gti,
             bicoherence_norm=bicoherence_norm,
             poisson_subtract=poisson_subtract,
+            bias_subtract=bias_subtract,
             silent=silent,
         )
 
@@ -965,6 +1038,7 @@ class Bispectrum(CrossBispectrum):
         gti=None,
         bicoherence_norm="kim_powers",
         poisson_subtract=False,
+        bias_subtract=False,
         silent=False,
     ):
         """Calculate a :class:`Bispectrum` from a time series."""
@@ -975,6 +1049,7 @@ class Bispectrum(CrossBispectrum):
             gti=gti,
             bicoherence_norm=bicoherence_norm,
             poisson_subtract=poisson_subtract,
+            bias_subtract=bias_subtract,
             silent=silent,
         )
 
@@ -1026,6 +1101,7 @@ class AveragedBispectrum(AveragedCrossBispectrum, Bispectrum):
         dt=None,
         bicoherence_norm="kim_powers",
         poisson_subtract=False,
+        bias_subtract=False,
         silent=False,
         save_all=False,
         save_diagonal=False,
@@ -1046,6 +1122,7 @@ class AveragedBispectrum(AveragedCrossBispectrum, Bispectrum):
         self.gti = gti
         self.bicoherence_norm = bicoherence_norm
         self.poisson_subtracted = poisson_subtract
+        self.bias_subtract = bias_subtract
         self.channels_overlap = True
         self.segment_size = segment_size
         self.save_all = save_all
@@ -1070,6 +1147,7 @@ class AveragedBispectrum(AveragedCrossBispectrum, Bispectrum):
             gti=gti,
             bicoherence_norm=bicoherence_norm,
             poisson_subtract=poisson_subtract,
+            bias_subtract=bias_subtract,
             silent=silent,
             save_all=save_all,
             save_diagonal=save_diagonal,
@@ -1087,6 +1165,7 @@ class AveragedBispectrum(AveragedCrossBispectrum, Bispectrum):
         gti=None,
         bicoherence_norm="kim_powers",
         poisson_subtract=False,
+        bias_subtract=False,
         silent=False,
         save_all=False,
         save_diagonal=False,
@@ -1098,6 +1177,7 @@ class AveragedBispectrum(AveragedCrossBispectrum, Bispectrum):
             gti=gti,
             bicoherence_norm=bicoherence_norm,
             poisson_subtract=poisson_subtract,
+            bias_subtract=bias_subtract,
             silent=silent,
             save_all=save_all,
             save_diagonal=save_diagonal,
@@ -1111,6 +1191,7 @@ class AveragedBispectrum(AveragedCrossBispectrum, Bispectrum):
         gti=None,
         bicoherence_norm="kim_powers",
         poisson_subtract=False,
+        bias_subtract=False,
         silent=False,
         save_all=False,
         save_diagonal=False,
@@ -1123,6 +1204,7 @@ class AveragedBispectrum(AveragedCrossBispectrum, Bispectrum):
             gti=gti,
             bicoherence_norm=bicoherence_norm,
             poisson_subtract=poisson_subtract,
+            bias_subtract=bias_subtract,
             silent=silent,
             save_all=save_all,
             save_diagonal=save_diagonal,
@@ -1136,6 +1218,7 @@ class AveragedBispectrum(AveragedCrossBispectrum, Bispectrum):
         gti=None,
         bicoherence_norm="kim_powers",
         poisson_subtract=False,
+        bias_subtract=False,
         silent=False,
         save_all=False,
         save_diagonal=False,
@@ -1148,6 +1231,7 @@ class AveragedBispectrum(AveragedCrossBispectrum, Bispectrum):
             gti=gti,
             bicoherence_norm=bicoherence_norm,
             poisson_subtract=poisson_subtract,
+            bias_subtract=bias_subtract,
             silent=silent,
             save_all=save_all,
             save_diagonal=save_diagonal,
@@ -1162,6 +1246,7 @@ class AveragedBispectrum(AveragedCrossBispectrum, Bispectrum):
         gti=None,
         bicoherence_norm="kim_powers",
         poisson_subtract=False,
+        bias_subtract=False,
         silent=False,
         save_all=False,
         save_diagonal=False,
@@ -1175,6 +1260,7 @@ class AveragedBispectrum(AveragedCrossBispectrum, Bispectrum):
             gti=gti,
             bicoherence_norm=bicoherence_norm,
             poisson_subtract=poisson_subtract,
+            bias_subtract=bias_subtract,
             silent=silent,
             save_all=save_all,
             save_diagonal=save_diagonal,
@@ -1188,6 +1274,7 @@ class AveragedBispectrum(AveragedCrossBispectrum, Bispectrum):
         gti=None,
         bicoherence_norm="kim_powers",
         poisson_subtract=False,
+        bias_subtract=False,
         silent=False,
         save_all=False,
         save_diagonal=False,
@@ -1200,6 +1287,7 @@ class AveragedBispectrum(AveragedCrossBispectrum, Bispectrum):
             gti=gti,
             bicoherence_norm=bicoherence_norm,
             poisson_subtract=poisson_subtract,
+            bias_subtract=bias_subtract,
             silent=silent,
             save_all=save_all,
             save_diagonal=save_diagonal,
@@ -1312,6 +1400,7 @@ class DynamicalCrossBispectrum(AveragedCrossBispectrum):
         bin_size=None,
         bicoherence_norm="kim_powers",
         poisson_subtract=False,
+        bias_subtract=False,
         channels_overlap=False,
         store="diagonal",
         gti=None,
@@ -1325,6 +1414,7 @@ class DynamicalCrossBispectrum(AveragedCrossBispectrum):
         self.gti = gti
         self.bicoherence_norm = bicoherence_norm
         self.poisson_subtract = poisson_subtract
+        self.bias_subtract = bias_subtract
         self.channels_overlap = channels_overlap
         self.poisson_subtracted = poisson_subtract and channels_overlap
         if store not in ("diagonal", "full"):
@@ -1401,6 +1491,7 @@ class DynamicalCrossBispectrum(AveragedCrossBispectrum):
             dt=self.sample_time,
             bicoherence_norm=self.bicoherence_norm,
             poisson_subtract=self.poisson_subtract,
+            bias_subtract=self.bias_subtract,
             channels_overlap=self.channels_overlap,
             silent=True,
         )
@@ -1899,6 +1990,7 @@ class DynamicalBispectrum(DynamicalCrossBispectrum):
         bin_size=None,
         bicoherence_norm="kim_powers",
         poisson_subtract=False,
+        bias_subtract=False,
         store="diagonal",
         gti=None,
         sample_time=None,
@@ -1910,6 +2002,7 @@ class DynamicalBispectrum(DynamicalCrossBispectrum):
             bin_size=bin_size,
             bicoherence_norm=bicoherence_norm,
             poisson_subtract=poisson_subtract,
+            bias_subtract=bias_subtract,
             channels_overlap=True,
             store=store,
             gti=gti,
@@ -1926,6 +2019,7 @@ class DynamicalBispectrum(DynamicalCrossBispectrum):
             dt=self.sample_time,
             bicoherence_norm=self.bicoherence_norm,
             poisson_subtract=self.poisson_subtract,
+            bias_subtract=self.bias_subtract,
             silent=True,
         )
 
@@ -1940,6 +2034,7 @@ def _populate_bispectrum_from_result_table(bs, table):
     bs.bicoherence = table.meta["bicoherence"]
     bs.bicoherence_norm = table.meta["bicoherence_norm"]
     bs.poisson_subtracted = table.meta.get("poisson_subtract", False)
+    bs.bias_subtract = table.meta.get("bias_subtract", False)
     bs.biphase = table.meta["biphase"]
     bs.bispec_err = table.meta["bispec_err"]
     bs.biphase_err = table.meta["biphase_err"]
@@ -2007,6 +2102,7 @@ def bispectrum_from_time_array(
     gti=None,
     bicoherence_norm="kim_powers",
     poisson_subtract=False,
+    bias_subtract=False,
     silent=False,
     save_all=False,
     save_diagonal=False,
@@ -2050,6 +2146,7 @@ def bispectrum_from_time_array(
         dt,
         bicoherence_norm=bicoherence_norm,
         poisson_subtract=poisson_subtract,
+        bias_subtract=bias_subtract,
         silent=silent,
         return_subbs=save_all,
         save_diagonal=save_diagonal,
@@ -2064,6 +2161,7 @@ def bispectrum_from_events(
     gti=None,
     bicoherence_norm="kim_powers",
     poisson_subtract=False,
+    bias_subtract=False,
     silent=False,
     save_all=False,
     save_diagonal=False,
@@ -2080,6 +2178,7 @@ def bispectrum_from_events(
         gti=gti,
         bicoherence_norm=bicoherence_norm,
         poisson_subtract=poisson_subtract,
+        bias_subtract=bias_subtract,
         silent=silent,
         save_all=save_all,
         save_diagonal=save_diagonal,
@@ -2092,6 +2191,7 @@ def bispectrum_from_lightcurve(
     gti=None,
     bicoherence_norm="kim_powers",
     poisson_subtract=False,
+    bias_subtract=False,
     silent=False,
     save_all=False,
     save_diagonal=False,
@@ -2112,6 +2212,7 @@ def bispectrum_from_lightcurve(
         lc.dt,
         bicoherence_norm=bicoherence_norm,
         poisson_subtract=poisson_subtract,
+        bias_subtract=bias_subtract,
         silent=silent,
         fluxes=lc.counts,
         errors=err,
@@ -2129,6 +2230,7 @@ def bispectrum_from_stingray_timeseries(
     gti=None,
     bicoherence_norm="kim_powers",
     poisson_subtract=False,
+    bias_subtract=False,
     silent=False,
     save_all=False,
     save_diagonal=False,
@@ -2149,6 +2251,7 @@ def bispectrum_from_stingray_timeseries(
         ts.dt,
         bicoherence_norm=bicoherence_norm,
         poisson_subtract=poisson_subtract,
+        bias_subtract=bias_subtract,
         silent=silent,
         fluxes=getattr(ts, flux_attr),
         errors=err,
@@ -2165,6 +2268,7 @@ def bispectrum_from_lc_iterable(
     gti=None,
     bicoherence_norm="kim_powers",
     poisson_subtract=False,
+    bias_subtract=False,
     silent=False,
     save_all=False,
     save_diagonal=False,
@@ -2207,6 +2311,7 @@ def bispectrum_from_lc_iterable(
         dt,
         bicoherence_norm=bicoherence_norm,
         poisson_subtract=poisson_subtract,
+        bias_subtract=bias_subtract,
         silent=silent,
         return_subbs=save_all,
         save_diagonal=save_diagonal,
@@ -2228,6 +2333,7 @@ def crossbispectrum_from_time_array(
     gti=None,
     bicoherence_norm="kim_powers",
     poisson_subtract=False,
+    bias_subtract=False,
     channels_overlap=False,
     silent=False,
     save_all=False,
@@ -2249,6 +2355,7 @@ def crossbispectrum_from_time_array(
         dt,
         bicoherence_norm=bicoherence_norm,
         poisson_subtract=poisson_subtract,
+        bias_subtract=bias_subtract,
         channels_overlap=channels_overlap,
         silent=silent,
         return_subbs=save_all,
@@ -2266,6 +2373,7 @@ def crossbispectrum_from_events(
     gti=None,
     bicoherence_norm="kim_powers",
     poisson_subtract=False,
+    bias_subtract=False,
     channels_overlap=False,
     silent=False,
     save_all=False,
@@ -2285,6 +2393,7 @@ def crossbispectrum_from_events(
         gti=gti,
         bicoherence_norm=bicoherence_norm,
         poisson_subtract=poisson_subtract,
+        bias_subtract=bias_subtract,
         channels_overlap=channels_overlap,
         silent=silent,
         save_all=save_all,
@@ -2300,6 +2409,7 @@ def crossbispectrum_from_lightcurve(
     gti=None,
     bicoherence_norm="kim_powers",
     poisson_subtract=False,
+    bias_subtract=False,
     channels_overlap=False,
     silent=False,
     save_all=False,
@@ -2341,6 +2451,7 @@ def crossbispectrum_from_lightcurve(
         lc1.dt,
         bicoherence_norm=bicoherence_norm,
         poisson_subtract=poisson_subtract,
+        bias_subtract=bias_subtract,
         channels_overlap=channels_overlap,
         silent=silent,
         fluxes1=lc1.counts,
@@ -2362,6 +2473,7 @@ def crossbispectrum_from_stingray_timeseries(
     gti=None,
     bicoherence_norm="kim_powers",
     poisson_subtract=False,
+    bias_subtract=False,
     channels_overlap=False,
     silent=False,
     save_all=False,
@@ -2382,6 +2494,7 @@ def crossbispectrum_from_stingray_timeseries(
         ts1.dt,
         bicoherence_norm=bicoherence_norm,
         poisson_subtract=poisson_subtract,
+        bias_subtract=bias_subtract,
         channels_overlap=channels_overlap,
         silent=silent,
         fluxes1=getattr(ts1, flux_attr),
@@ -2402,6 +2515,7 @@ def crossbispectrum_from_lc_iterable(
     gti=None,
     bicoherence_norm="kim_powers",
     poisson_subtract=False,
+    bias_subtract=False,
     channels_overlap=False,
     silent=False,
     save_all=False,
@@ -2444,6 +2558,7 @@ def crossbispectrum_from_lc_iterable(
         dt,
         bicoherence_norm=bicoherence_norm,
         poisson_subtract=poisson_subtract,
+        bias_subtract=bias_subtract,
         channels_overlap=channels_overlap,
         silent=silent,
         return_subbs=save_all,
