@@ -3673,7 +3673,9 @@ def avg_cross_bispectrum_from_iterables(
             "nphots1": nphots1,
             "nphots2": nphots2,
             "nphots3": nphots3,
-            "nphots": (nphots1 * nphots2 * nphots3) ** (1 / 3),
+            # Geometric mean of the per-channel counts. np.cbrt (not ** (1/3))
+            # stays real for non-count inputs, where the product can be negative.
+            "nphots": np.cbrt(nphots1 * nphots2 * nphots3),
             "segment_size": dt * n_bin,
         }
     )
