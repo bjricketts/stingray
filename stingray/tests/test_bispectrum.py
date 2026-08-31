@@ -424,6 +424,114 @@ class TestBispectrumEstimator(object):
         assert abs(res.meta["biphase"][i1, i2]) < 0.2
 
 
+class TestBispectrumCumulant(object):
+    """The legacy 3rd-order-cumulant estimator, exposed as method='cumulant'."""
+
+    @classmethod
+    def setup_class(cls):
+        cls.dt = 0.1
+        cls.n = 256
+        cls.lc = Lightcurve(
+            np.arange(cls.n) * cls.dt,
+            rng.poisson(50, cls.n).astype(float),
+            dt=cls.dt,
+            skip_checks=True,
+        )
+
+    def teardown_method(self):
+        clear_all_figs()
+
+    def test_default_method_is_fourier(self):
+        bs = Bispectrum(self.lc)
+        assert bs.method == "fourier"
+        assert bs.bicoherence is not None
+        assert bs.cum3 is None
+
+    def test_bad_method_raises(self):
+        with pytest.raises(ValueError):
+            Bispectrum(self.lc, method="nope")
+        with pytest.raises(ValueError):
+            AveragedBispectrum(self.lc, segment_size=2.0, method="nope")
+
+    def test_reproduces_reference_values(self):
+        # Golden values from the original stingray cumulant Bispectrum docstring.
+        lc = Lightcurve(
+            np.array([1, 2, 3, 4, 5]), np.array([2, 3, 1, 1, 2]), dt=1, skip_checks=True
+        )
+        bs = Bispectrum(lc, method="cumulant", maxlag=1)
+        assert np.allclose(bs.lags, [-1, 0, 1])
+        assert np.allclose(bs.freq, [-0.5, 0.0, 0.5])
+        cum3_ref = [[-0.2976, 0.1024, 0.1408], [0.1024, 0.144, -0.2976], [0.1408, -0.2976, 0.1024]]
+        assert np.allclose(bs.cum3, cum3_ref, atol=1e-4)
+        mag_ref = [[1.263368, 0.0032, 0.0032], [0.0032, 0.16, 0.0032], [0.0032, 0.0032, 1.263368]]
+        assert np.allclose(bs.bispec_mag, mag_ref, atol=1e-4)
+
+    def test_cumulant_attributes_and_shapes(self):
+        maxlag = 30
+        bs = Bispectrum(self.lc, method="cumulant", maxlag=maxlag)
+        nlag = 2 * maxlag + 1
+        assert bs.method == "cumulant"
+        assert bs.cum3.shape == (nlag, nlag)
+        assert bs.bispec.shape == (nlag, nlag)
+        assert bs.lags.shape == (nlag,)
+        assert bs.freq.shape == (nlag,)
+        assert bs.maxlag == maxlag
+        assert bs.scale == "biased"
+        # the cumulant method produces no bicoherence
+        assert bs.bicoherence is None
+
+    def test_bispec_is_fft_of_cumulant(self):
+        from stingray.utils import fftshift, fft2, ifftshift
+
+        bs = Bispectrum(self.lc, method="cumulant", maxlag=20)
+        expected = fftshift(fft2(ifftshift(bs.cum3)))
+        assert np.allclose(bs.bispec, expected)
+        assert np.allclose(bs.bispec_mag, np.abs(bs.bispec))
+        assert np.allclose(bs.biphase, np.angle(bs.bispec))
+
+    def test_windowed_differs_from_unwindowed(self):
+        plain = Bispectrum(self.lc, method="cumulant", maxlag=30)
+        windowed = Bispectrum(self.lc, method="cumulant", maxlag=30, window="parzen")
+        assert not np.allclose(plain.bispec_mag, windowed.bispec_mag)
+        assert windowed.window == "parzen"
+
+    def test_biased_differs_from_unbiased(self):
+        biased = Bispectrum(self.lc, method="cumulant", maxlag=30, scale="biased")
+        unbiased = Bispectrum(self.lc, method="cumulant", maxlag=30, scale="unbiased")
+        assert not np.allclose(biased.cum3, unbiased.cum3)
+
+    def test_invalid_cumulant_params(self):
+        with pytest.raises(ValueError):
+            Bispectrum(self.lc, method="cumulant", scale="nope")
+        with pytest.raises(ValueError):
+            Bispectrum(self.lc, method="cumulant", window="not-a-window")
+        with pytest.raises(ValueError):
+            Bispectrum(self.lc, method="cumulant", maxlag=10 * self.n)
+
+    def test_from_eventlist(self):
+        ev = EventList(np.sort(rng.uniform(0, 100, 5000)), gti=[[0, 100]])
+        bs = Bispectrum(ev, dt=0.1, method="cumulant", maxlag=20)
+        assert bs.method == "cumulant"
+        assert bs.cum3 is not None
+
+    def test_averaged_cumulant(self):
+        abs_c = AveragedBispectrum(self.lc, segment_size=2.0, method="cumulant", maxlag=15)
+        assert abs_c.method == "cumulant"
+        assert abs_c.m > 1
+        assert abs_c.cum3.shape == (31, 31)
+        assert abs_c.bicoherence is None
+
+    def test_plot_cum3(self):
+        bs = Bispectrum(self.lc, method="cumulant", maxlag=20)
+        ax = bs.plot_cum3()
+        assert ax is not None
+
+    def test_plot_cum3_requires_cumulant(self):
+        bs = Bispectrum(self.lc)  # fourier
+        with pytest.raises(ValueError):
+            bs.plot_cum3()
+
+
 class TestBispectrumNormalization(object):
     @classmethod
     def setup_class(cls):

@@ -4,12 +4,14 @@ from collections.abc import Generator, Iterable
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
+from scipy.linalg import toeplitz
 
 from stingray.base import StingrayObject
 
 from .events import EventList
 from .lightcurve import Lightcurve
 from .gti import cross_two_gtis, time_intervals_from_gtis
+from .utils import create_window, fft2, fftshift, ifftshift
 from .fourier import (
     avg_bispectrum_from_iterable,
     avg_bispectrum_from_timeseries,
@@ -17,6 +19,24 @@ from .fourier import (
     avg_cross_bispectrum_from_timeseries,
     bicoherence_from_sums,
     get_flux_iterable_from_segments,
+)
+
+#: Bispectrum estimation methods. ``"fourier"`` is the direct Fourier-
+#: decomposition estimator (Maccarone 2013); ``"cumulant"`` is the legacy
+#: indirect estimator (FFT of the 3rd-order cumulant). Auto-bispectrum only.
+BISPECTRUM_METHODS = ("fourier", "cumulant")
+
+#: Lag windows accepted by ``method="cumulant"`` (passed to
+#: ``stingray.utils.create_window``).
+CUMULANT_WINDOWS = (
+    "uniform",
+    "parzen",
+    "hamming",
+    "hanning",
+    "triangular",
+    "welch",
+    "blackmann",
+    "flat-top",
 )
 
 __all__ = [
@@ -318,6 +338,13 @@ class CrossBispectrum(StingrayObject):
         self.nphots3 = None
         self.segment_size = None
         self.gti = None
+        # method / cumulant-estimator attributes (auto-bispectrum only)
+        self.method = getattr(self, "method", "fourier")
+        self.cum3 = None
+        self.lags = None
+        self.maxlag = None
+        self.window = None
+        self.scale = None
         return
 
     def recompute_bicoherence(self, norm=None, bias_subtract=False, inplace=False):
@@ -860,6 +887,27 @@ class Bispectrum(CrossBispectrum):
         normalizations. Can also be toggled after the fact with
         :meth:`recompute_bicoherence`.
 
+    method : {"fourier", "cumulant"}, default "fourier"
+        Which estimator to use. ``"fourier"`` is the direct Fourier-decomposition
+        estimator (Maccarone 2013) described above. ``"cumulant"`` is the legacy
+        *indirect* estimator: the bispectrum as the 2-D Fourier transform of the
+        3rd-order cumulant of the light curve (Rao & Gabr 1984), retained for
+        backward comparison. It uses ``maxlag``, ``window`` and ``scale`` below,
+        ignores ``bicoherence_norm`` / ``poisson_subtract`` / ``bias_subtract``,
+        and produces no bicoherence; the auto-bispectrum only.
+
+    maxlag : int, optional
+        (``method="cumulant"`` only.) Maximum lag of the 3rd-order cumulant.
+        Defaults to half the light-curve length.
+
+    window : str, optional
+        (``method="cumulant"`` only.) Lag window to taper the cumulant
+        (``"parzen"``, ``"hamming"``, ``"hanning"``, ...); ``None`` applies no
+        window.
+
+    scale : {"biased", "unbiased"}, default "biased"
+        (``method="cumulant"`` only.) Normalization of the 3rd-order cumulant.
+
     skip_checks : bool, default False
         Skip initial checks.
 
@@ -868,7 +916,15 @@ class Bispectrum(CrossBispectrum):
 
     Attributes
     ----------
-    See :class:`CrossBispectrum`. ``nphots1 = nphots2 = nphots3 = nphots``.
+    See :class:`CrossBispectrum`. ``nphots1 = nphots2 = nphots3 = nphots``. With
+    ``method="cumulant"`` the extra attributes ``cum3`` (the 3rd-order cumulant),
+    ``lags``, ``maxlag``, ``window`` and ``scale`` are set, and ``bicoherence``
+    is ``None``.
+
+    References
+    ----------
+    Rao, T. S. & Gabr, M. M., *An Introduction to Bispectral Analysis and
+    Bilinear Time Series Models*, Lecture Notes in Statistics 24 (1984).
     """
 
     def __init__(
@@ -879,6 +935,10 @@ class Bispectrum(CrossBispectrum):
         bicoherence_norm="kim_powers",
         poisson_subtract=False,
         bias_subtract=False,
+        method="fourier",
+        maxlag=None,
+        window=None,
+        scale="biased",
         skip_checks=False,
         lc=None,
     ):
@@ -887,6 +947,10 @@ class Bispectrum(CrossBispectrum):
             warnings.warn("The lc keyword is now deprecated. Use data instead", DeprecationWarning)
         if data is None:
             data = lc
+
+        if method not in BISPECTRUM_METHODS:
+            raise ValueError(f"Unknown method '{method}'. Choose one of {BISPECTRUM_METHODS}.")
+        self.method = method
 
         good_input = data is not None
         if good_input and not skip_checks:
@@ -901,6 +965,11 @@ class Bispectrum(CrossBispectrum):
 
         if not good_input:
             return self._initialize_empty()
+
+        if method == "cumulant":
+            return self._make_cumulant_bispectrum(
+                data, dt=dt, maxlag=maxlag, window=window, scale=scale
+            )
 
         return self._initialize_from_any_input(
             data,
@@ -1053,6 +1122,296 @@ class Bispectrum(CrossBispectrum):
             silent=silent,
         )
 
+    # -- legacy indirect (3rd-order cumulant) estimator --------------------
+    #
+    # The following methods implement ``method="cumulant"``: the bispectrum as
+    # the 2-D Fourier transform of the 3rd-order cumulant of the light curve.
+    # This is the original stingray algorithm, retained for comparison with the
+    # Fourier-decomposition default. Auto-bispectrum only.
+
+    @staticmethod
+    def _cumulant_lightcurve(data, dt):
+        """Return a :class:`Lightcurve` for the cumulant estimator."""
+        if isinstance(data, Lightcurve):
+            return data
+        if isinstance(data, EventList):
+            if dt is None:
+                raise ValueError("dt must be specified for an EventList with method='cumulant'.")
+            return data.to_lc(dt)
+        raise TypeError("method='cumulant' accepts a Lightcurve or EventList.")
+
+    @staticmethod
+    def _validate_cumulant_params(n, maxlag, window, scale):
+        """
+        Validate/normalize the cumulant parameters.
+
+        Parameters
+        ----------
+        n : int
+            The length of the signal.
+        maxlag : int or None
+            The maximum lag to compute the cumulant over. If ``None``, 
+            defaults to ``n // 2``.
+        window : str or None
+            The window function to apply. Must be one of ``CUMULANT_WINDOWS`` 
+            or ``None``.
+        scale : str
+            The scaling method, either ``'biased'`` or ``'unbiased'``.
+        
+        Returns
+        -------
+        maxlag : int
+            The validated maximum lag.
+        window : str or None
+            The validated window function.
+        scale : str
+            The validated scaling method.
+        """
+        if not isinstance(scale, str) or scale.lower() not in ("biased", "unbiased"):
+            raise ValueError("scale must be 'biased' or 'unbiased'.")
+        scale = scale.lower()
+        if window is not None:
+            if not isinstance(window, str):
+                raise TypeError("window must be a string.")
+            if window.lower() not in CUMULANT_WINDOWS:
+                raise ValueError(f"Unknown window '{window}'. Choose one of {CUMULANT_WINDOWS}.")
+            window = window.lower()
+        if maxlag is None:
+            maxlag = int(n / 2)
+        else:
+            if not np.issubdtype(type(maxlag), np.integer):
+                raise ValueError("maxlag must be an integer.")
+            maxlag = abs(int(maxlag))
+        if maxlag < 1 or maxlag >= n:
+            raise ValueError("maxlag must be between 1 and the segment length.")
+        return maxlag, window, scale
+
+    @staticmethod
+    def _cumulant3(signal, n, maxlag):
+        """
+        Raw 3rd-order cumulant (a ``2*maxlag+1`` square) of a ``1 x n`` signal.
+
+        Parameters
+        ----------
+        signal : array_like
+            The input signal, shape (1, n).
+        n : int
+            The length of the signal.
+        maxlag : int
+            The maximum lag to compute the cumulant over.
+
+        Returns
+        -------
+        cum3 : ndarray
+            The raw 3rd-order cumulant, shape (2*maxlag+1, 2*maxlag+1).
+        """
+        # Initializes cumulant matrix
+        cum3 = np.zeros((2 * maxlag + 1, 2 * maxlag + 1))
+        # Define indices for the Toeplitz matrix
+        ind = np.arange((n - maxlag) - 1, n)
+        ind_t = np.arange(maxlag, n)
+        zero_maxlag = np.zeros((1, maxlag))
+        zero_maxlag_t = zero_maxlag.transpose()
+
+        sig = signal.transpose()
+
+        rev_signal = np.array([signal[0][::-1]])
+        col = np.concatenate((sig[ind], zero_maxlag_t), axis=0)
+        row = np.concatenate((rev_signal[0][ind_t], zero_maxlag[0]), axis=0)
+
+        #Converts to Toeplitz matrix and calculates the cumulant
+        toep = toeplitz(np.ravel(col), np.ravel(row))
+        rev_signal = np.repeat(rev_signal, [2 * maxlag + 1], axis=0)
+        return cum3 + np.matmul(np.multiply(toep, rev_signal), toep.transpose())
+
+    @staticmethod
+    def _normalize_cumulant3(cum3, n, maxlag, scale):
+        """
+        Biased or unbiased normalization of the 3rd-order cumulant.
+        
+        Parameters
+        ----------
+        cum3 : ndarray
+            The raw 3rd-order cumulant, shape (2*maxlag+1, 2*maxlag+1).
+        n : int
+            The length of the signal.
+        maxlag : int
+            The maximum lag to compute the cumulant over.
+        scale : str
+            The normalization scale, either "biased" or "unbiased".
+
+        Returns
+        -------
+        cum3 : ndarray
+            The normalized 3rd-order cumulant, shape (2*maxlag+1, 2*maxlag+1).
+        """
+
+        # Biased normalization is just the raw cumulant divided by n. 
+        if scale == "biased":
+            return cum3 / n
+        else: # Ubiased normalization of cumulant
+            maxlag1 = maxlag + 1
+
+            scal_matrix = np.zeros((maxlag1, maxlag1), dtype="int64")
+
+            for k in range(maxlag1):
+                maxlag1k = maxlag1 - (k + 1)
+                scal_matrix[k, k:maxlag1] = np.tile(n - maxlag1k, (1, maxlag1k + 1))
+            scal_matrix += np.triu(scal_matrix, k=1).transpose()
+
+            maxlag1ind = np.arange(maxlag - 1, -1, -1)
+            lagdiff = n - maxlag1
+
+            col = np.arange(lagdiff, n - 1)
+            col = np.reshape(col, (1, len(col))).transpose()
+            row = np.arange(lagdiff, (n - 2 * maxlag) - 1, -1)
+            row = np.reshape(row, (1, len(row)))
+
+            toep_matrix = toeplitz(np.ravel(col), np.ravel(row))
+
+            conc_mat = np.array([scal_matrix[maxlag, maxlag1ind]])
+
+            join_matrix = np.concatenate((toep_matrix, conc_mat), axis=0)
+            scal_matrix = np.concatenate((scal_matrix, join_matrix), axis=1)
+            co_mat = scal_matrix[maxlag1ind, :]
+            co_mat = co_mat[:, np.arange(2 * maxlag, -1, -1)]
+
+            scal_matrix = np.concatenate((scal_matrix, co_mat), axis=0)
+            scal_matrix[scal_matrix < 1] = 1
+            return np.divide(cum3, scal_matrix)
+
+    @staticmethod
+    def _cumulant_window(maxlag, window_name):
+        """
+        2-D lag window for the cumulant, or ``None``.
+
+        Parameters
+        ----------
+        maxlag : int
+            The maximum lag to compute the cumulant over.
+        window_name : str or None
+            The name of the window to apply. If ``None``, no window is applied.
+
+        Returns
+        -------
+        window : ndarray or None
+            The 2-D lag window, shape (2*maxlag+1, 2*maxlag+1), or ``None`` if 
+            no window is applied.
+        """
+        if window_name is None:
+            return None
+        N = 2 * maxlag + 1
+        window_even = create_window(N, window_name)
+        window2d = np.array([window_even] * N)
+        window = np.zeros(N)
+        window[: maxlag + 1] = window_even[maxlag:]
+        window[maxlag:] = 0
+        row = np.concatenate(([window[0]], np.zeros(2 * maxlag)))
+        toep_matrix = toeplitz(np.ravel(window), np.ravel(row))
+        toep_matrix += np.tril(toep_matrix, -1).transpose()
+        return toep_matrix[..., ::-1] * window2d * window2d.transpose()
+
+    def _finalize_cumulant(self, cum3, n, maxlag, dt, window_name, scale):
+        """
+        Populate the object from a (normalized) cumulant matrix.
+        
+        Parameters
+        ----------
+        cum3 : ndarray
+            The normalized 3rd-order cumulant, shape (2*maxlag+1, 2*maxlag+1).
+        n : int
+            The length of the signal.
+        maxlag : int
+            The maximum lag to compute the cumulant over.
+        dt : float
+            The time resolution of the light curve.
+        window_name : str or None
+            The name of the window applied to the cumulant. If ``None``, no 
+            window is applied.
+        scale : str
+            The normalization scale, either "biased" or "unbiased".
+        """
+        lagindex = np.arange(-maxlag, maxlag + 1)
+        self.lags = lagindex * dt
+        self.freq = 0.5 * (1.0 / dt) * lagindex / maxlag
+        window = self._cumulant_window(maxlag, window_name)
+        if window is None:
+            bispec = fftshift(fft2(ifftshift(cum3)))
+        else:
+            bispec = fftshift(fft2(ifftshift(cum3 * window)))
+        self.cum3 = cum3
+        self.maxlag = maxlag
+        self.window = window_name
+        self.scale = scale
+        self.bispec = bispec
+        self.bispec_mag = np.abs(bispec)
+        self.biphase = np.angle(bispec)
+        self.bispec_phase = self.biphase
+        self.n = n
+        self.df = float(self.freq[1] - self.freq[0]) if self.freq.size > 1 else None
+        self.bicoherence = None
+
+    def _make_cumulant_bispectrum(self, data, dt=None, maxlag=None, window=None, scale="biased"):
+        """
+        Single (whole light curve) cumulant bispectrum.
+
+        Parameters
+        ----------
+        data : :class:`stingray.Lightcurve` or :class:`stingray.events.EventList`
+            The light curve or event list to be Fourier-transformed.
+        dt : float, optional
+            The time resolution of the light curve. Only needed for an
+            :class:`EventList`.
+        maxlag : int, optional
+            Maximum lag of the 3rd-order cumulant. Defaults to half the 
+            light-curve length.
+        window : str, optional
+            Lag window to taper the cumulant (``"parzen"``, ``"hamming"``, 
+            ``"hanning"``, ...); ``None`` applies no window.
+        scale : {"biased", "unbiased"}, default "biased"
+            Normalization of the 3rd-order cumulant.
+        """
+        lc = self._cumulant_lightcurve(data, dt)
+        counts = np.asarray(lc.counts, dtype=float)
+        n = counts.size
+        maxlag, window, scale = self._validate_cumulant_params(n, maxlag, window, scale)
+        signal = (counts - counts.mean()).reshape(1, n)
+        cum3 = self._normalize_cumulant3(self._cumulant3(signal, n, maxlag), n, maxlag, scale)
+        self.dt = lc.dt
+        self.m = 1
+        self.method = "cumulant"
+        self._finalize_cumulant(cum3, n, maxlag, lc.dt, window, scale)
+        return
+
+    def plot_cum3(self, ax=None, save=False, filename=None):
+        """
+        Plot the 3rd-order cumulant as a function of lag (``method="cumulant"`` 
+        only).
+
+        Parameters
+        ----------
+        ax : matplotlib.axes.Axes, optional
+            The axes on which to plot. If ``None``, a new figure and axes are
+            created.
+        save : bool, default False
+            If ``True``, save the figure to a file.
+        filename : str, optional
+            The filename to save the figure to. If ``None``, defaults to
+            "bispec_cum3.png".
+        """
+        if getattr(self, "cum3", None) is None:
+            raise ValueError("plot_cum3 is only available for method='cumulant'.")
+        if ax is None:
+            _, ax = plt.subplots()
+        cont = ax.contourf(self.lags, self.lags, self.cum3, 100, cmap=plt.cm.Spectral_r)
+        ax.figure.colorbar(cont, ax=ax)
+        ax.set_title("3rd Order Cumulant")
+        ax.set_xlabel("Lag 1")
+        ax.set_ylabel("Lag 2")
+        if save:
+            ax.figure.savefig(filename if filename is not None else "bispec_cum3.png")
+        return ax
+
 
 class AveragedBispectrum(AveragedCrossBispectrum, Bispectrum):
     type = "bispectrum"
@@ -1102,6 +1461,10 @@ class AveragedBispectrum(AveragedCrossBispectrum, Bispectrum):
         bicoherence_norm="kim_powers",
         poisson_subtract=False,
         bias_subtract=False,
+        method="fourier",
+        maxlag=None,
+        window=None,
+        scale="biased",
         silent=False,
         save_all=False,
         save_diagonal=False,
@@ -1113,6 +1476,10 @@ class AveragedBispectrum(AveragedCrossBispectrum, Bispectrum):
             warnings.warn("The lc keyword is now deprecated. Use data instead", DeprecationWarning)
         if data is None:
             data = lc
+
+        if method not in BISPECTRUM_METHODS:
+            raise ValueError(f"Unknown method '{method}'. Choose one of {BISPECTRUM_METHODS}.")
+        self.method = method
 
         good_input = data is not None
         if good_input and not skip_checks:
@@ -1129,6 +1496,11 @@ class AveragedBispectrum(AveragedCrossBispectrum, Bispectrum):
 
         if not good_input:
             return self._initialize_empty()
+
+        if method == "cumulant":
+            return self._make_cumulant_bispectrum_averaged(
+                data, dt=dt, segment_size=segment_size, maxlag=maxlag, window=window, scale=scale
+            )
 
         if isinstance(data, Generator):
             warnings.warn(
@@ -1157,6 +1529,44 @@ class AveragedBispectrum(AveragedCrossBispectrum, Bispectrum):
         if data is not None and segment_size is None:
             raise ValueError("segment_size must be specified for an AveragedBispectrum.")
         return Bispectrum.initial_checks(self, data=data, dt=dt, segment_size=segment_size)
+
+    def _make_cumulant_bispectrum_averaged(
+        self, data, dt=None, segment_size=None, maxlag=None, window=None, scale="biased"
+    ):
+        """Segment-averaged cumulant bispectrum: average the per-segment 3rd-order
+        cumulant over segments, then Fourier-transform."""
+        lc = self._cumulant_lightcurve(data, dt)
+        dt = lc.dt
+        n_bin = int(np.rint(segment_size / dt))
+        maxlag, window, scale = self._validate_cumulant_params(n_bin, maxlag, window, scale)
+        gti = self.gti if self.gti is not None else lc.gti
+        flux_iterable = get_flux_iterable_from_segments(
+            lc.time, np.asarray(gti), segment_size, n_bin, dt=dt, fluxes=lc.counts
+        )
+        cum3_sum = None
+        m = 0
+        for flux in flux_iterable:
+            if flux is None:
+                continue
+            if isinstance(flux, tuple):
+                flux = flux[0]
+            flux = np.asarray(flux, dtype=float)
+            if flux.size < n_bin or np.all(flux == 0):
+                continue
+            signal = (flux - flux.mean()).reshape(1, flux.size)
+            c = self._normalize_cumulant3(
+                self._cumulant3(signal, flux.size, maxlag), flux.size, maxlag, scale
+            )
+            cum3_sum = c if cum3_sum is None else cum3_sum + c
+            m += 1
+        if cum3_sum is None:
+            raise ValueError("No usable segments were found for the cumulant bispectrum.")
+        cum3 = cum3_sum / m
+        self.dt = dt
+        self.m = m
+        self.method = "cumulant"
+        self._finalize_cumulant(cum3, n_bin, maxlag, dt, window, scale)
+        return
 
     @staticmethod
     def from_lightcurve(
