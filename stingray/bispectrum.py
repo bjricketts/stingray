@@ -1150,14 +1150,14 @@ class Bispectrum(CrossBispectrum):
         n : int
             The length of the signal.
         maxlag : int or None
-            The maximum lag to compute the cumulant over. If ``None``, 
+            The maximum lag to compute the cumulant over. If ``None``,
             defaults to ``n // 2``.
         window : str or None
-            The window function to apply. Must be one of ``CUMULANT_WINDOWS`` 
+            The window function to apply. Must be one of ``CUMULANT_WINDOWS``
             or ``None``.
         scale : str
             The scaling method, either ``'biased'`` or ``'unbiased'``.
-        
+
         Returns
         -------
         maxlag : int
@@ -1219,7 +1219,7 @@ class Bispectrum(CrossBispectrum):
         col = np.concatenate((sig[ind], zero_maxlag_t), axis=0)
         row = np.concatenate((rev_signal[0][ind_t], zero_maxlag[0]), axis=0)
 
-        #Converts to Toeplitz matrix and calculates the cumulant
+        # Converts to Toeplitz matrix and calculates the cumulant
         toep = toeplitz(np.ravel(col), np.ravel(row))
         rev_signal = np.repeat(rev_signal, [2 * maxlag + 1], axis=0)
         return cum3 + np.matmul(np.multiply(toep, rev_signal), toep.transpose())
@@ -1228,7 +1228,7 @@ class Bispectrum(CrossBispectrum):
     def _normalize_cumulant3(cum3, n, maxlag, scale):
         """
         Biased or unbiased normalization of the 3rd-order cumulant.
-        
+
         Parameters
         ----------
         cum3 : ndarray
@@ -1246,10 +1246,10 @@ class Bispectrum(CrossBispectrum):
             The normalized 3rd-order cumulant, shape (2*maxlag+1, 2*maxlag+1).
         """
 
-        # Biased normalization is just the raw cumulant divided by n. 
+        # Biased normalization is just the raw cumulant divided by n.
         if scale == "biased":
             return cum3 / n
-        else: # Ubiased normalization of cumulant
+        else:  # Ubiased normalization of cumulant
             maxlag1 = maxlag + 1
 
             scal_matrix = np.zeros((maxlag1, maxlag1), dtype="int64")
@@ -1295,7 +1295,7 @@ class Bispectrum(CrossBispectrum):
         Returns
         -------
         window : ndarray or None
-            The 2-D lag window, shape (2*maxlag+1, 2*maxlag+1), or ``None`` if 
+            The 2-D lag window, shape (2*maxlag+1, 2*maxlag+1), or ``None`` if
             no window is applied.
         """
         if window_name is None:
@@ -1314,7 +1314,7 @@ class Bispectrum(CrossBispectrum):
     def _finalize_cumulant(self, cum3, n, maxlag, dt, window_name, scale):
         """
         Populate the object from a (normalized) cumulant matrix.
-        
+
         Parameters
         ----------
         cum3 : ndarray
@@ -1326,7 +1326,7 @@ class Bispectrum(CrossBispectrum):
         dt : float
             The time resolution of the light curve.
         window_name : str or None
-            The name of the window applied to the cumulant. If ``None``, no 
+            The name of the window applied to the cumulant. If ``None``, no
             window is applied.
         scale : str
             The normalization scale, either "biased" or "unbiased".
@@ -1363,10 +1363,10 @@ class Bispectrum(CrossBispectrum):
             The time resolution of the light curve. Only needed for an
             :class:`EventList`.
         maxlag : int, optional
-            Maximum lag of the 3rd-order cumulant. Defaults to half the 
+            Maximum lag of the 3rd-order cumulant. Defaults to half the
             light-curve length.
         window : str, optional
-            Lag window to taper the cumulant (``"parzen"``, ``"hamming"``, 
+            Lag window to taper the cumulant (``"parzen"``, ``"hamming"``,
             ``"hanning"``, ...); ``None`` applies no window.
         scale : {"biased", "unbiased"}, default "biased"
             Normalization of the 3rd-order cumulant.
@@ -1385,7 +1385,7 @@ class Bispectrum(CrossBispectrum):
 
     def plot_cum3(self, ax=None, save=False, filename=None):
         """
-        Plot the 3rd-order cumulant as a function of lag (``method="cumulant"`` 
+        Plot the 3rd-order cumulant as a function of lag (``method="cumulant"``
         only).
 
         Parameters
