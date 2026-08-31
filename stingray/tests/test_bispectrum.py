@@ -13,12 +13,15 @@ from stingray.bispectrum import (
     AveragedCrossBispectrum,
     DynamicalBispectrum,
     DynamicalCrossBispectrum,
+    crossbispectrum_from_stingray_timeseries,
+    crossbispectrum_from_lc_iterable,
 )
 from stingray.fourier import (
     fftfreq,
     positive_fft_bins,
     avg_bispectrum_from_iterable,
     avg_bispectrum_from_timeseries,
+    avg_cross_bispectrum_from_iterables,
     bicoherence_from_sums,
     BICOHERENCE_NORMS,
     _bispectrum_frequency_grid,
@@ -206,6 +209,14 @@ class TestAveragedBispectrum(object):
         cls.time = np.arange(cls.n) * cls.dt
         cls.counts = rng.poisson(40, cls.n).astype(float)
         cls.lc = Lightcurve(cls.time, cls.counts, dt=cls.dt, skip_checks=True)
+        cls.gauss_lc = Lightcurve(
+            cls.time,
+            cls.counts,
+            err=np.sqrt(cls.counts + 1),
+            err_dist="gauss",
+            dt=cls.dt,
+            skip_checks=True,
+        )
         cls.events = EventList(
             np.sort(rng.uniform(0, cls.n * cls.dt, 8000)), gti=[[0, cls.n * cls.dt]]
         )
@@ -293,6 +304,54 @@ class TestAveragedBispectrum(object):
 
     def test_skip_checks(self):
         AveragedBispectrum(self.lc, segment_size=self.segment_size, skip_checks=True)
+
+    def test_initial_checks_none_returns_false(self):
+        assert Bispectrum().initial_checks(data=None) is False
+
+    def test_averaged_segment_too_small(self):
+        with pytest.raises(ValueError):
+            AveragedBispectrum(self.lc, segment_size=self.dt)
+
+    def test_eventlist_init_dispatch(self):
+        bs = Bispectrum(self.events, dt=0.1)
+        assert bs.bispec is not None
+
+    def test_gauss_errors_lightcurve(self):
+        bs = AveragedBispectrum(self.gauss_lc, segment_size=self.segment_size)
+        assert bs.m > 1
+
+    def test_from_lc_iterable_with_gti_and_errors(self):
+        bs = AveragedBispectrum.from_lc_iterable(
+            [self.gauss_lc], self.dt, self.segment_size, gti=[[0, self.n * self.dt]]
+        )
+        assert bs.m > 1
+
+    def test_from_lc_iterable_arrays(self):
+        n_bin = int(self.segment_size / self.dt)
+        segs = [self.counts[i : i + n_bin] for i in range(0, self.n - n_bin, n_bin)]
+        bs = AveragedBispectrum.from_lc_iterable(segs, self.dt, self.segment_size)
+        assert bs.m > 1
+
+    def test_averaged_from_stingray_timeseries_with_errors(self):
+        ts = StingrayTimeseries(
+            self.time,
+            array_attrs={"flux": self.counts, "flux_err": np.sqrt(self.counts + 1)},
+            dt=self.dt,
+            skip_checks=True,
+        )
+        ts.gti = self.lc.gti
+        bs = AveragedBispectrum.from_stingray_timeseries(
+            ts, "flux", self.segment_size, error_flux_attr="flux_err"
+        )
+        assert bs.m > 1
+
+    def test_averaged_segment_too_small_events(self):
+        with pytest.raises(ValueError):
+            AveragedBispectrum(self.events, segment_size=0.05, dt=0.1)
+
+    def test_generator_input_warns(self):
+        with pytest.warns(UserWarning):
+            AveragedBispectrum((lc for lc in [self.lc]), segment_size=self.segment_size)
 
 
 class TestBispectrumEstimator(object):
@@ -531,6 +590,53 @@ class TestBispectrumCumulant(object):
         with pytest.raises(ValueError):
             bs.plot_cum3()
 
+    def test_default_maxlag(self):
+        bs = Bispectrum(self.lc, method="cumulant")  # maxlag defaults to n // 2
+        assert bs.maxlag == self.n // 2
+
+    def test_window_must_be_string(self):
+        with pytest.raises(TypeError):
+            Bispectrum(self.lc, method="cumulant", maxlag=20, window=5)
+
+    def test_maxlag_must_be_integer(self):
+        with pytest.raises(ValueError):
+            Bispectrum(self.lc, method="cumulant", maxlag=1.5)
+
+    def test_eventlist_without_dt_raises(self):
+        ev = EventList(np.sort(rng.uniform(0, 100, 2000)), gti=[[0, 100]])
+        with pytest.raises(ValueError):
+            Bispectrum(ev, method="cumulant", maxlag=10, skip_checks=True)
+
+    def test_bad_input_type_raises(self):
+        with pytest.raises(TypeError):
+            Bispectrum([self.lc], method="cumulant", maxlag=10)
+
+    def test_plot_cum3_save(self, tmp_path):
+        bs = Bispectrum(self.lc, method="cumulant", maxlag=20)
+        fname = str(tmp_path / "cum3.png")
+        bs.plot_cum3(save=True, filename=fname)
+        assert os.path.exists(fname)
+
+    def test_averaged_segment_longer_than_lc_raises(self):
+        # segment longer than the light curve is rejected (no full segment)
+        with pytest.raises((ValueError, AssertionError)):
+            AveragedBispectrum(
+                self.lc, segment_size=self.n * self.dt * 10, method="cumulant", maxlag=5
+            )
+
+    def test_averaged_cumulant_skips_zero_segments(self):
+        # a partially-zero light curve exercises the all-zero segment skip
+        counts = self.lc.counts.copy()
+        counts[: counts.size // 2] = 0.0
+        lc = Lightcurve(self.lc.time, counts, dt=self.dt, skip_checks=True)
+        bs = AveragedBispectrum(lc, segment_size=2.0, method="cumulant", maxlag=5)
+        assert bs.m >= 1
+
+    def test_averaged_cumulant_all_zero_raises(self):
+        lc = Lightcurve(self.lc.time, np.zeros(self.n), dt=self.dt, skip_checks=True)
+        with pytest.raises(ValueError):
+            AveragedBispectrum(lc, segment_size=2.0, method="cumulant", maxlag=5)
+
 
 class TestBispectrumNormalization(object):
     @classmethod
@@ -627,6 +733,11 @@ class TestBispectrumNormalization(object):
         bs = AveragedBispectrum(self.lc, segment_size=self.segment_size)
         with pytest.raises(ValueError):
             bs.recompute_bicoherence(norm="hagihira", bias_subtract=True)
+
+    def test_bicoherence_from_sums_bias_requires_nseg(self):
+        a = np.ones((3, 3))
+        with pytest.raises(ValueError):
+            bicoherence_from_sums("kim_powers", a, a, a, a, bias_subtract=True)
 
     def test_bias_subtract_cross(self):
         xbs = AveragedCrossBispectrum(
@@ -802,6 +913,11 @@ class TestBispectrumJellyfish(object):
         ax = self.bs.plot_jellyfish(freqs=[self.f0])
         assert ax is not None
 
+    def test_no_resolved_diagonal_freqs_raises(self):
+        # frequencies beyond the resolved diagonal leave nothing to draw
+        with pytest.raises(ValueError):
+            self.bs.plot_jellyfish(freqs=[10 * self.bs.freq[-1]])
+
     def test_endpoint_radius_is_bicoherence(self):
         # The drawn fundamental path endpoint amplitude equals the (sigl_chamoun)
         # bicoherence, and its angle is the biphase.
@@ -916,6 +1032,15 @@ class TestCrossBispectrum(object):
             cls.time, rng2.poisson(50, cls.n).astype(float), dt=cls.dt, skip_checks=True
         )
         cls.xbs = CrossBispectrum(cls.lc1, cls.lc2, cls.lc3)
+        cls.gti = [[0, cls.n * cls.dt]]
+        rng_ev = np.random.RandomState(99)
+        cls.evs = [
+            EventList(np.sort(rng_ev.uniform(0, cls.n * cls.dt, 4000)), gti=cls.gti)
+            for _ in range(3)
+        ]
+
+    def teardown_method(self):
+        clear_all_figs()
 
     def test_type_and_hierarchy(self):
         assert self.xbs.type == "crossbispectrum"
@@ -1087,6 +1212,115 @@ class TestCrossBispectrum(object):
         )
         assert overlap.poisson_subtracted is True
 
+    # --- input-dispatch paths and factories -------------------------------
+
+    def test_init_from_events_dispatch(self):
+        xbs = CrossBispectrum(*self.evs, dt=0.1)
+        assert xbs.bispec is not None
+
+    def test_init_from_lc_iterables_dispatch(self):
+        xbs = CrossBispectrum([self.lc1], [self.lc2], [self.lc3])
+        assert xbs.bispec is not None
+
+    def test_initial_checks_none_returns_false(self):
+        assert CrossBispectrum().initial_checks(data1=None) is False
+
+    def test_initial_checks_bad_type(self):
+        with pytest.raises(TypeError):
+            CrossBispectrum(1, 1, 1)
+
+    def test_segment_size_too_small(self):
+        with pytest.raises(ValueError):
+            AveragedCrossBispectrum(self.lc1, self.lc2, self.lc3, segment_size=self.dt, dt=self.dt)
+
+    def test_from_time_array(self):
+        xbs = CrossBispectrum.from_time_array(
+            self.evs[0].time, self.evs[1].time, self.evs[2].time, 0.1, gti=self.gti
+        )
+        assert isinstance(xbs, CrossBispectrum)
+
+    def test_averaged_from_lightcurve_static(self):
+        xbs = AveragedCrossBispectrum.from_lightcurve(
+            self.lc1, self.lc2, self.lc3, self.segment_size
+        )
+        assert xbs.m > 1
+
+    def test_averaged_from_events_static(self):
+        xbs = AveragedCrossBispectrum.from_events(*self.evs, 0.1, self.segment_size)
+        assert isinstance(xbs, AveragedCrossBispectrum)
+
+    def test_from_stingray_timeseries(self):
+        tss = [
+            StingrayTimeseries(
+                self.time, array_attrs={"flux": lc.counts}, dt=self.dt, skip_checks=True
+            )
+            for lc in (self.lc1, self.lc2, self.lc3)
+        ]
+        for ts in tss:
+            ts.gti = np.asarray(self.gti)
+        xbs = crossbispectrum_from_stingray_timeseries(*tss, "flux", segment_size=self.segment_size)
+        assert xbs.m > 1
+
+    def test_from_lc_iterable(self):
+        xbs = crossbispectrum_from_lc_iterable(
+            [self.lc1], [self.lc2], [self.lc3], self.dt, segment_size=self.segment_size
+        )
+        assert isinstance(xbs, AveragedCrossBispectrum)
+
+    def test_events_without_dt_raises(self):
+        with pytest.raises(ValueError):
+            CrossBispectrum(*self.evs)
+
+    def test_averaged_single_arg_defaults_to_auto(self):
+        xbs = AveragedCrossBispectrum(self.lc1, segment_size=self.segment_size)
+        assert xbs.m > 1
+
+    def test_from_lc_iterable_with_gti(self):
+        xbs = crossbispectrum_from_lc_iterable(
+            [self.lc1],
+            [self.lc2],
+            [self.lc3],
+            self.dt,
+            segment_size=self.segment_size,
+            gti=[[0, self.n * self.dt]],
+        )
+        assert isinstance(xbs, AveragedCrossBispectrum)
+
+    def test_from_lc_iterable_arrays(self):
+        n_bin = int(self.segment_size / self.dt)
+        seg = [self.lc1.counts[:n_bin], self.lc1.counts[n_bin : 2 * n_bin]]
+        xbs = crossbispectrum_from_lc_iterable(
+            list(seg), list(seg), list(seg), self.dt, segment_size=self.segment_size
+        )
+        assert xbs.m == 2
+
+    def test_from_lc_iterable_bad_input(self):
+        with pytest.raises(TypeError):
+            crossbispectrum_from_lc_iterable([1], [1], [1], self.dt, segment_size=self.segment_size)
+
+    def test_save_all_cross(self):
+        xbs = AveragedCrossBispectrum(
+            self.lc1, self.lc2, self.lc3, segment_size=self.segment_size, save_all=True
+        )
+        assert xbs.bispec_all is not None
+        assert len(xbs.bispec_all) == xbs.m
+
+    def test_all_zero_channels_raise(self):
+        zero = Lightcurve(self.time, np.zeros(self.n), dt=self.dt, skip_checks=True)
+        with pytest.raises(ValueError):
+            AveragedCrossBispectrum(zero, zero, zero, segment_size=self.segment_size)
+
+    def test_estimator_accepts_error_tuples(self):
+        # the estimator unwraps (flux, error) tuples yielded per segment
+        rng2 = np.random.RandomState(1)
+        n_bin = 128
+
+        def segs():
+            return [(rng2.poisson(50, n_bin).astype(float), np.ones(n_bin)) for _ in range(20)]
+
+        res = avg_cross_bispectrum_from_iterables(segs(), segs(), segs(), 0.01)
+        assert res is not None
+
 
 def _blinking_diagonal_lc(rng_local, n_blocks, seg_per_block, n_bin, dt, nu, on):
     """Auto light curve with harmonic (nu -> 2 nu) coupling switched per block.
@@ -1128,6 +1362,13 @@ class TestDynamicalBispectrum(object):
             cls.lc,
             segment_size=cls.segment_size,
             bin_size=cls.bin_size,
+            bicoherence_norm="sigl_chamoun",
+        )
+        cls.full = DynamicalBispectrum(
+            cls.lc,
+            segment_size=cls.segment_size,
+            bin_size=cls.bin_size,
+            store="full",
             bicoherence_norm="sigl_chamoun",
         )
 
@@ -1276,6 +1517,106 @@ class TestDynamicalBispectrum(object):
         _, bic, _ = db.trace(self.nu, self.nu)
         assert np.all(bic[np.array(self.on)] > 0.7)
 
+    def test_requires_data(self):
+        with pytest.raises(TypeError):
+            DynamicalBispectrum(segment_size=self.segment_size, bin_size=self.bin_size)
+
+    def test_eventlist_needs_sample_time(self):
+        ev = EventList(np.sort(rng.uniform(0, 200, 3000)), gti=[[0, 200]])
+        with pytest.raises(ValueError):
+            DynamicalBispectrum(ev, segment_size=self.segment_size, bin_size=self.bin_size)
+
+    def test_segment_too_short(self):
+        with pytest.raises(ValueError):
+            DynamicalBispectrum(self.lc, segment_size=self.dt, bin_size=self.bin_size)
+
+    def test_explicit_gti(self):
+        db = DynamicalBispectrum(
+            self.lc,
+            segment_size=self.segment_size,
+            bin_size=self.bin_size,
+            gti=[[0, self.n_blocks * self.bin_size]],
+            bicoherence_norm="sigl_chamoun",
+        )
+        assert db.time.size >= 1
+
+    def test_plot_diagonal_empty_raises(self):
+        with pytest.raises(ValueError):
+            DynamicalBispectrum().plot_diagonal()
+
+    def test_plot_trace(self):
+        axes = self.db.plot_trace(self.nu, self.nu)
+        assert len(axes) == 2
+
+    def test_trace_maximum_defaults(self):
+        pos = self.db.trace_maximum()
+        assert pos.size == self.db.time.size
+
+    def test_trace_maximum_full_store(self):
+        pos = self.full.trace_maximum(min_freq=1, max_freq=20)
+        assert pos.size == self.full.time.size
+
+    def test_rebin_by_n_intervals_identity(self):
+        assert self.db.rebin_by_n_intervals(1).time.size == self.db.time.size
+
+    def test_rebin_by_n_intervals_noninteger_warns(self):
+        with pytest.warns(UserWarning):
+            self.db.rebin_by_n_intervals(2.0)
+
+    def test_rebin_by_n_intervals_bad_n(self):
+        with pytest.raises(ValueError):
+            self.db.rebin_by_n_intervals(0)
+
+    def test_rebin_frequency_identity(self):
+        assert self.db.rebin_frequency(self.db.df).freq.size == self.db.freq.size
+
+    def test_rebin_frequency_must_increase(self):
+        with pytest.raises(ValueError):
+            self.db.rebin_frequency(self.db.df / 2)
+
+    def test_rebin_frequency_full_store_not_implemented(self):
+        with pytest.raises(NotImplementedError):
+            self.full.rebin_frequency(2 * self.full.df)
+
+    def test_plot_montage_times_and_diagonal_guard(self):
+        axes = self.full.plot_montage(times=[self.full.time[0], self.full.time[-1]])
+        assert axes is not None
+        with pytest.raises(ValueError):
+            self.db.plot_montage()  # diagonal store cannot montage
+
+    def test_single_time_bin_plot(self):
+        # bin_size spanning the whole observation -> a single time bin, which
+        # exercises the size-1 branch of the pcolormesh edge helper.
+        total = self.n_blocks * self.bin_size
+        db = DynamicalBispectrum(
+            self.lc,
+            segment_size=self.segment_size,
+            bin_size=total,
+            bicoherence_norm="sigl_chamoun",
+        )
+        assert db.time.size == 1
+        assert db.plot_diagonal() is not None
+
+    def test_skips_unusable_bins(self):
+        # zero out the first bin -> that bin has no usable segments and is dropped
+        counts = self.lc.counts.copy()
+        counts[: int(self.bin_size / self.dt)] = 0.0
+        lc = Lightcurve(self.lc.time, counts, dt=self.dt, skip_checks=True)
+        with pytest.warns(UserWarning):
+            db = DynamicalBispectrum(
+                lc,
+                segment_size=self.segment_size,
+                bin_size=self.bin_size,
+                bicoherence_norm="sigl_chamoun",
+            )
+        assert db.time.size == self.n_blocks - 1
+
+    def test_all_bins_unusable_raises(self):
+        n = self.n_blocks * self.seg_per_block * self.n_bin
+        lc = Lightcurve(np.arange(n) * self.dt, np.zeros(n), dt=self.dt, skip_checks=True)
+        with pytest.raises(ValueError):
+            DynamicalBispectrum(lc, segment_size=self.segment_size, bin_size=self.bin_size)
+
 
 class TestDynamicalCrossBispectrum(object):
     @classmethod
@@ -1363,4 +1704,16 @@ class TestDynamicalCrossBispectrum(object):
                 np.nan_to_num(cross.dyn_bicoherence[:, ic]),
                 np.nan_to_num(auto.dyn_bicoherence[:, ia]),
                 atol=1e-6,
+            )
+
+    def test_mismatched_kinds_raise(self):
+        ev = EventList(np.sort(rng.uniform(0, 100, 500)), gti=[[0, 100]])
+        with pytest.raises(ValueError):
+            DynamicalCrossBispectrum(
+                self.lcX,
+                ev,
+                self.lcZ,
+                sample_time=self.dt,
+                segment_size=self.segment_size,
+                bin_size=self.bin_size,
             )

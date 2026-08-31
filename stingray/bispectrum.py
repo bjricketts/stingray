@@ -1546,10 +1546,6 @@ class AveragedBispectrum(AveragedCrossBispectrum, Bispectrum):
         cum3_sum = None
         m = 0
         for flux in flux_iterable:
-            if flux is None:
-                continue
-            if isinstance(flux, tuple):
-                flux = flux[0]
             flux = np.asarray(flux, dtype=float)
             if flux.size < n_bin or np.all(flux == 0):
                 continue
@@ -1940,10 +1936,11 @@ class DynamicalCrossBispectrum(AveragedCrossBispectrum):
             bin_gti = cross_two_gtis(gti, np.array([[ts, te]]))
             try:
                 avg = self._build_bin(data1, data2, data3, bin_gti)
-            except ValueError:
+            except (ValueError, AssertionError):
+                # a bin with no usable segments (too short, or all zero) is skipped
                 n_skipped += 1
                 continue
-            if getattr(avg, "freq", None) is None:
+            if getattr(avg, "freq", None) is None:  # pragma: no cover
                 n_skipped += 1
                 continue
 
