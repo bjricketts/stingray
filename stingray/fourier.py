@@ -3153,8 +3153,8 @@ def bicoherence_from_sums(
         :math:`\approx 1/M` with ``M = n_seg`` averaged segments (Fackrell 1996;
         Elgar & Guza 1988; Kim & Powers 1979). With this option the bias is
         removed in the squared domain, :math:`b^2 \rightarrow b^2 - 1/M`, and the
-        result mapped back to the requested normalization. Only defined for 
-        ``"kim_powers"`` (the squared form) and ``"sigl_chamoun"`` (its 
+        result mapped back to the requested normalization. Only defined for
+        ``"kim_powers"`` (the squared form) and ``"sigl_chamoun"`` (its
         signed root); a ``ValueError`` is raised for ``"hagihira"``.
 
     Returns
