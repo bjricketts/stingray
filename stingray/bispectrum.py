@@ -48,6 +48,40 @@ __all__ = [
     "DynamicalBispectrum",
 ]
 
+#: Set once the interface-change notice has been emitted, so it is shown only
+#: on the first bispectrum object created in a session (see
+#: ``_warn_interface_change``).
+_INTERFACE_CHANGE_WARNED = False
+
+
+def _warn_interface_change():
+    """Emit a one-time notice that the bispectrum interface has changed.
+
+    The direct Fourier-decomposition estimator (Maccarone 2013) is now the
+    default, replacing the legacy third-order-cumulant method, and the
+    ``Bispectrum`` / ``AveragedBispectrum`` and cross-bispectrum classes have
+    been reworked. The cumulant estimator is still available via
+    ``method="cumulant"``. The notice is shown once per session, the first time
+    any bispectrum object is constructed, and points to the documentation for
+    the changes.
+    """
+    global _INTERFACE_CHANGE_WARNED
+    if _INTERFACE_CHANGE_WARNED:
+        return
+    _INTERFACE_CHANGE_WARNED = True
+    warnings.warn(
+        "The stingray bispectrum interface has changed. The default estimator is "
+        "now the direct Fourier-decomposition method (Maccarone 2013) instead of "
+        "the third-order-cumulant method, and the Bispectrum/AveragedBispectrum "
+        "and cross-bispectrum classes have been reworked. The cumulant estimator "
+        "is still available via method='cumulant'. See the bispectrum "
+        "documentation for the changes: "
+        "https://docs.stingray.science/en/stable/notebooks/Bispectrum/"
+        "bispectrum_tutorial.html",
+        UserWarning,
+        stacklevel=3,
+    )
+
 
 class CrossBispectrum(StingrayObject):
     main_array_attr = "freq"
@@ -195,6 +229,7 @@ class CrossBispectrum(StingrayObject):
         channels_overlap=False,
         skip_checks=False,
     ):
+        _warn_interface_change()
         self._type = None
         # Missing channels default to data1 (the auto-bispectrum).
         if data1 is not None:
@@ -713,6 +748,7 @@ class AveragedCrossBispectrum(CrossBispectrum):
         save_diagonal=False,
         skip_checks=False,
     ):
+        _warn_interface_change()
         self._type = None
         if data1 is not None:
             if data2 is None:
@@ -942,6 +978,7 @@ class Bispectrum(CrossBispectrum):
         skip_checks=False,
         lc=None,
     ):
+        _warn_interface_change()
         self._type = None
         if lc is not None:
             warnings.warn("The lc keyword is now deprecated. Use data instead", DeprecationWarning)
@@ -1471,6 +1508,7 @@ class AveragedBispectrum(AveragedCrossBispectrum, Bispectrum):
         skip_checks=False,
         lc=None,
     ):
+        _warn_interface_change()
         self._type = None
         if lc is not None:
             warnings.warn("The lc keyword is now deprecated. Use data instead", DeprecationWarning)
@@ -1813,6 +1851,7 @@ class DynamicalCrossBispectrum(AveragedCrossBispectrum):
         sample_time=None,
         skip_checks=False,
     ):
+        _warn_interface_change()
         self._type = None
         self.segment_size = segment_size
         self.bin_size = bin_size
