@@ -2352,7 +2352,7 @@ class DynamicalCrossspectrum(AveragedCrossspectrum):
          units the ``time`` array in the :class:`Lightcurve`` object uses).
 
     norm: {"leahy" | "frac" | "abs" | "none" }, optional, default "frac"
-        The normaliation of the periodogram to be used. The mean count rate that
+        The normalization of the periodogram to be used. The mean count rate that
         is used in the fractional normalization is selected with ``use_common_mean``.
 
     Other Parameters
